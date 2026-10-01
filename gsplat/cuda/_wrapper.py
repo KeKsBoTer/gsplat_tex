@@ -107,6 +107,7 @@ def _ensure_autograd_registrations() -> None:
     _register_autograd(RegisterProjection2DGSPacked)
     _register_autograd(RegisterRasterizeToPixels3DGS)
     _register_autograd(RegisterRasterizeToPixels2DGS)
+    _register_autograd(RegisterRasterizeToPixelsBBSplat)
     _register_autograd(RegisterRasterizeToPixelsSparse)
     _AUTOGRAD_REGISTRATIONS_DONE = True
 
@@ -273,6 +274,10 @@ def has_camera_wrappers():
 
 def has_2dgs():
     return _has_build_feature("2dgs")
+
+
+def has_bbsplat():
+    return _has_build_feature("bbsplat")
 
 
 def has_3dgs():
@@ -1264,6 +1269,102 @@ def isect_tiles(
         segmented,
     )
     return tiles_per_gauss, isect_ids, flatten_ids
+
+
+@torch.no_grad()
+def isect_tiles_2dgs(
+    means2d: Tensor,  # [..., N, 2] or [nnz, 2]
+    radii: Tensor,  # [..., N, 2] or [nnz, 2]
+    depths: Tensor,  # [..., N] or [nnz]
+    ray_transforms: Tensor,  # [..., N, 3, 3] or [nnz, 3, 3]
+    tile_size: int,
+    tile_width: int,
+    tile_height: int,
+    opacities: Optional[Tensor] = None,  # [..., N] or [nnz]
+    uv_rects: Optional[Tensor] = None,  # [..., N, 4] or [nnz, 4]
+    sort: bool = True,
+    segmented: bool = False,
+    packed: bool = False,
+    n_images: Optional[int] = None,
+    image_ids: Optional[Tensor] = None,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Maps projected 2DGS or BBSplat primitives to the tiles their footprint overlaps.
+
+    Unlike :func:`isect_tiles`, which assigns the axis-aligned box ``means2d +- radii``,
+    this tests each tile against the exact screen-space footprint, derived from the
+    ray transforms (the plane-to-pixel homography):
+
+    - 2DGS (pass `opacities`): the projected ellipse ``u^2 + v^2 <= t`` with
+      ``t = min(GAUSSIAN_EXTEND^2, 2 ln(opacity / ALPHA_THRESHOLD))``, united with
+      the screen-space low-pass disk the 2DGS rasterizer also accepts.
+    - BBSplat (pass `uv_rects`): the projected convex quad of the splat-local
+      rectangle ``[u0, u1] x [v0, v1]``. See :func:`bbsplat_uv_rects`.
+
+    Footprints that cross the camera plane fall back to the ``means2d +- radii`` box.
+
+    Args:
+        means2d: Projected means (the 2DGS low-pass disk center). [..., N, 2] or [nnz, 2].
+        radii: Projection radii; primitives with a zero radius are skipped. [..., N, 2] or [nnz, 2].
+        depths: Z-depths. [..., N] or [nnz].
+        ray_transforms: Ray transforms from :func:`fully_fused_projection_2dgs`. [..., N, 3, 3] or [nnz, 3, 3].
+        tile_size, tile_width, tile_height: Tile grid.
+        opacities: 2DGS opacities (float32). [..., N] or [nnz]. Exclusive with `uv_rects`.
+        uv_rects: BBSplat rectangles ``(u0, u1, v0, v1)`` (float32); ``u0 > u1`` culls. [..., N, 4] or [nnz, 4].
+        sort, segmented, packed, n_images, image_ids: Same as :func:`isect_tiles`.
+
+    Returns:
+        Same tuple as :func:`isect_tiles`: (tiles_per_gauss, isect_ids, flatten_ids).
+    """
+    return _make_lazy_cuda_func("intersect_tile_2dgs")(
+        means2d.contiguous(),
+        radii.contiguous(),
+        depths.contiguous(),
+        ray_transforms.contiguous(),
+        opacities.contiguous() if opacities is not None else None,
+        uv_rects.contiguous() if uv_rects is not None else None,
+        image_ids.contiguous() if image_ids is not None else None,
+        n_images,
+        tile_size,
+        tile_width,
+        tile_height,
+        sort,
+        segmented,
+    )
+
+
+@torch.no_grad()
+def bbsplat_uv_rects(
+    texture_alphas: Tensor,  # [..., S, S]
+    opacities: Optional[Tensor] = None,  # [...]
+) -> Tensor:
+    """Splat-local rectangles that bound where a BBSplat primitive can reach ALPHA_THRESHOLD.
+
+    The rasterizer samples the alpha texture bilinearly (``align_corners=True``, zero
+    padding), so ``opacity * texture_alpha(u, v)`` is a convex combination of the
+    (at most four) surrounding texels and can only reach ALPHA_THRESHOLD within one
+    texel of a texel that does. The returned rectangle spans the open one-texel
+    neighborhood of all such texels, so splats with mostly transparent textures get
+    a footprint much smaller than their full square.
+
+    Args:
+        texture_alphas: Alpha textures (post-activation). [..., S, S], S >= 2.
+        opacities: Optional opacity multipliers. [...]
+
+    Returns:
+        ``(u0, u1, v0, v1)`` per splat, float32 [..., 4]. Splats without any
+        such texel get the empty rectangle ``(1, -1, 1, -1)``.
+    """
+    lead = texture_alphas.shape[:-2]
+    S = texture_alphas.shape[-1]
+    rects = _make_lazy_cuda_func("bbsplat_uv_rects")(
+        texture_alphas.reshape(-1, S, S).contiguous(),
+        (
+            opacities.to(texture_alphas.dtype).reshape(-1).contiguous()
+            if opacities is not None
+            else None
+        ),
+    )
+    return rects.reshape(lead + (4,))
 
 
 @torch.no_grad()
@@ -2646,6 +2747,8 @@ def fully_fused_projection_2dgs(
     radius_clip: float = 0.0,
     packed: bool = False,
     sparse_grad: bool = False,
+    opacities: Optional[Tensor] = None,
+    uv_rects: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Prepare Gaussians for rasterization
 
@@ -2666,6 +2769,12 @@ def fully_fused_projection_2dgs(
         packed: If True, the output tensors will be packed into a flattened tensor. Default: False.
         sparse_grad (Experimental): This is only effective when `packed` is True. If True, during backward the gradients
           of {`means`, `covars`, `quats`, `scales`} will be a sparse Tensor in COO layout. Default: False.
+        opacities: Optional 2DGS opacities (float32). [..., N]. If given, primitives are culled and `radii`
+          sized by their exact opacity-aware footprint (the projected ellipse plus low-pass disk, see
+          :func:`isect_tiles_2dgs`) instead of a fixed 3.33-sigma box, and primitives below
+          ALPHA_THRESHOLD are culled. Exclusive with `uv_rects`.
+        uv_rects: Optional BBSplat rectangles (float32, see :func:`bbsplat_uv_rects`). [..., N, 4]. If given,
+          culling and `radii` use the projected quad of each rectangle, and empty rectangles are culled.
 
     Returns:
         A tuple:
@@ -2712,6 +2821,8 @@ def fully_fused_projection_2dgs(
             far_plane,
             radius_clip,
             sparse_grad,
+            opacities.contiguous() if opacities is not None else None,
+            uv_rects.contiguous() if uv_rects is not None else None,
         )
     else:
         return _make_lazy_cuda_func("projection_2dgs_fused")(
@@ -2726,6 +2837,8 @@ def fully_fused_projection_2dgs(
             near_plane,
             far_plane,
             radius_clip,
+            opacities.contiguous() if opacities is not None else None,
+            uv_rects.contiguous() if uv_rects is not None else None,
         )
 
 
@@ -2748,6 +2861,8 @@ class RegisterProjection2DGSFused:
             _near_plane,
             _far_plane,
             _radius_clip,
+            _opacities,
+            _uv_rects,
         ) = inputs
         radii, _means2d, _depths, ray_transforms, _normals = output
         ctx.width = width
@@ -2805,6 +2920,8 @@ class RegisterProjection2DGSFused:
             None,  # near_plane
             None,  # far_plane
             None,  # radius_clip
+            None,  # opacities
+            None,  # uv_rects
         )
 
 
@@ -2827,6 +2944,8 @@ class RegisterProjection2DGSPacked:
             _far_plane,
             _radius_clip,
             sparse_grad,
+            _opacities,
+            _uv_rects,
         ) = inputs
         (
             batch_ids,
@@ -2914,6 +3033,8 @@ class RegisterProjection2DGSPacked:
             None,  # far_plane
             None,  # radius_clip
             None,  # sparse_grad
+            None,  # opacities
+            None,  # uv_rects
         )
 
 
@@ -3149,6 +3270,244 @@ class RegisterRasterizeToPixels2DGS:
             None,  # packed
             None,  # absgrad
             None,  # distloss
+        )
+
+
+def rasterize_to_pixels_bbsplat(
+    ray_transforms: Tensor,  # [..., N, 3, 3]
+    colors: Tensor,  # [..., N, channels]
+    opacities: Tensor,  # [..., N]
+    normals: Tensor,  # [..., N, 3]
+    densify: Tensor,  # [..., N, 2]
+    texture_alphas: Tensor,  # [M, S, S]
+    texture_colors: Optional[Tensor],  # [M, S, S, TC]
+    texture_ids: Tensor,  # [..., N]
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [..., tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+    backgrounds: Optional[Tensor] = None,  # [..., channels]
+    masks: Optional[Tensor] = None,  # [..., tile_height, tile_width]
+    packed: bool = False,
+    compute_impact: bool = False,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Rasterize textured 2D billboards (BBSplat) to pixels.
+
+    Same as :func:`rasterize_to_pixels_2dgs` (same projection outputs, tiling and
+    compositing), but the per-pixel Gaussian kernel is replaced by bilinear texture
+    lookups at the ray-splat intersection (u, v):
+
+    - ``alpha = min(0.99, opacity * texture_alpha(u, v))``
+    - ``color = colors + texture_color(u, v)`` (the texture is added to the first
+      ``TC`` channels, so a depth channel appended to ``colors`` stays untextured)
+
+    The texture covers (u, v) in [-1, 1]^2, i.e. +-scale along the splat's two
+    tangent axes. Sampling matches ``F.grid_sample(align_corners=True,
+    padding_mode="zeros")`` with u indexing columns and v indexing rows. Unlike 2DGS
+    there is no screen-space low-pass filter, so ``means2d`` is not used and gets no
+    gradient; use ``densify`` for densification.
+
+    Args:
+        ray_transforms: Ray transforms from :func:`fully_fused_projection_2dgs`. [..., N, 3, 3] or [nnz, 3, 3].
+        colors: Per-splat base colors (e.g. view-dependent SH colors). [..., N, channels] or [nnz, channels].
+        opacities: Per-splat opacity multiplier for the alpha texture. Pass ones for vanilla BBSplat. [..., N] or [nnz].
+        normals: Camera-space normals. [..., N, 3] or [nnz, 3].
+        densify: Dummy tensor that receives the densification gradient. [..., N, 2] or [nnz, 2].
+        texture_alphas: Per-splat alpha textures (already activated). [M, S, S].
+        texture_colors: Optional per-splat color textures. [M, S, S, TC] with TC <= channels.
+        texture_ids: int32 index into the M textures for every splat. [..., N] or [nnz].
+        isect_offsets: Intersection offsets from `isect_offset_encode()`. [..., tile_height, tile_width]
+        flatten_ids: Flattened splat indices from `isect_tiles()`. [n_isects]
+        backgrounds: Background colors. [..., channels]. Default: None.
+        masks: Optional tile mask to skip rendering to masked tiles. [..., tile_height, tile_width]. Default: None.
+        packed: If True, the per-splat inputs are packed with shape [nnz, ...]. Default: False.
+        compute_impact: If True, also accumulate each splat's total blending weight
+            (sum of alpha * T over all pixels, BBSplat's "impact"). Default: False.
+
+    Returns:
+        A tuple:
+
+        - **Rendered colors**.      [..., image_height, image_width, channels]
+        - **Rendered alphas**.      [..., image_height, image_width, 1]
+        - **Rendered normals**.     [..., image_height, image_width, 3]
+        - **Rendered distortion**.  [..., image_height, image_width, 1]
+        - **Rendered median depth**.[..., image_height, image_width, 1]
+        - **Impacts**. Per-splat sum of alpha * T. [..., N] or [nnz]; empty if not `compute_impact`.
+    """
+    (
+        render_colors,
+        render_alphas,
+        render_normals,
+        render_distort,
+        render_median,
+        impacts,
+        _last_ids,
+        _median_ids,
+    ) = _make_lazy_cuda_func("rasterize_to_pixels_bbsplat")(
+        ray_transforms.contiguous(),
+        colors.contiguous(),
+        opacities.contiguous(),
+        normals.contiguous(),
+        densify.contiguous(),
+        texture_alphas.contiguous(),
+        texture_colors.contiguous() if texture_colors is not None else None,
+        texture_ids.int().contiguous(),
+        backgrounds.contiguous() if backgrounds is not None else None,
+        masks.contiguous() if masks is not None else None,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+        packed,
+        compute_impact,
+    )
+    return (
+        render_colors,
+        render_alphas,
+        render_normals,
+        render_distort,
+        render_median,
+        impacts,
+    )
+
+
+class RegisterRasterizeToPixelsBBSplat:
+    """Python autograd hooks for the gsplat::rasterize_to_pixels_bbsplat op."""
+
+    base = "rasterize_to_pixels_bbsplat"
+
+    @staticmethod
+    def setup_context(ctx, inputs, output) -> None:
+        (
+            ray_transforms,
+            colors,
+            opacities,
+            normals,
+            densify,
+            texture_alphas,
+            texture_colors,
+            texture_ids,
+            backgrounds,
+            masks,
+            image_width,
+            image_height,
+            tile_size,
+            tile_offsets,
+            flatten_ids,
+            _packed,
+            _compute_impact,
+        ) = inputs
+        render_colors, render_alphas, _, _, _, impacts, last_ids, median_ids = output
+        ctx.mark_non_differentiable(impacts, last_ids, median_ids)
+        ctx.width = image_width
+        ctx.height = image_height
+        ctx.tile_size = tile_size
+        ctx.save_for_backward(
+            ray_transforms,
+            colors,
+            opacities,
+            normals,
+            densify,
+            texture_alphas,
+            texture_colors,
+            texture_ids,
+            backgrounds,
+            masks,
+            tile_offsets,
+            flatten_ids,
+            render_colors,
+            render_alphas,
+            last_ids,
+            median_ids,
+        )
+
+    @classmethod
+    def backward(
+        cls,
+        ctx,
+        v_render_colors,
+        v_render_alphas,
+        v_render_normals,
+        v_render_distort,
+        v_render_median,
+        v_impacts,
+        v_last_ids,
+        v_median_ids,
+    ):
+        (
+            ray_transforms,
+            colors,
+            opacities,
+            normals,
+            densify,
+            texture_alphas,
+            texture_colors,
+            texture_ids,
+            backgrounds,
+            masks,
+            tile_offsets,
+            flatten_ids,
+            render_colors,
+            render_alphas,
+            last_ids,
+            median_ids,
+        ) = ctx.saved_tensors
+        (
+            v_ray_transforms,
+            v_colors,
+            v_opacities,
+            v_normals,
+            v_densify,
+            v_texture_alphas,
+            v_texture_colors,
+            v_backgrounds,
+        ) = _make_lazy_cuda_func(f"{cls.base}_bwd")(
+            ray_transforms,
+            colors,
+            opacities,
+            normals,
+            densify,
+            texture_alphas,
+            texture_colors,
+            texture_ids,
+            backgrounds,
+            masks,
+            tile_offsets,
+            flatten_ids,
+            render_colors,
+            render_alphas,
+            last_ids,
+            median_ids,
+            ctx.width,
+            ctx.height,
+            ctx.tile_size,
+            v_render_colors,
+            v_render_alphas,
+            v_render_normals,
+            v_render_distort,
+            v_render_median,
+            ctx.needs_input_grad[8],  # backgrounds is input index 8
+        )
+        return (
+            v_ray_transforms,
+            v_colors,
+            v_opacities,
+            v_normals,
+            v_densify,
+            v_texture_alphas,
+            v_texture_colors,
+            None,  # texture_ids
+            v_backgrounds,
+            None,  # masks
+            None,  # image_width
+            None,  # image_height
+            None,  # tile_size
+            None,  # tile_offsets
+            None,  # flatten_ids
+            None,  # packed
+            None,  # compute_impact
         )
 
 

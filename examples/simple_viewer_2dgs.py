@@ -104,7 +104,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
 
         if render_tab_state.render_mode == "depth":
             # normalize depth to [0, 1]
-            depth = render_median
+            depth = render_median[0]  # [H, W, 1]
             if render_tab_state.normalize_nearfar:
                 near_plane = render_tab_state.near_plane
                 far_plane = render_tab_state.far_plane
@@ -121,7 +121,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
                 .numpy()
             )
         elif render_tab_state.render_mode == "normal":
-            render_normals = render_normals * 0.5 + 0.5  # normalize to [0, 1]
+            render_normals = render_normals[0] * 0.5 + 0.5  # [H, W, 3], normalize to [0, 1]
             renders = render_normals.cpu().numpy()
         elif render_tab_state.render_mode == "alpha":
             alpha = render_alphas[0, ..., 0:1]

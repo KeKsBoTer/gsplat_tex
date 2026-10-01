@@ -35,7 +35,6 @@ if os.path.exists(_version_file):
     with open(_version_file, "r") as f:
         exec(f.read())
 
-URL = "https://github.com/nerfstudio-project/gsplat"
 
 BUILD_NO_CUDA = os.getenv("BUILD_NO_CUDA", "0") == "1"
 BUILD_EXPERIMENTAL = os.getenv("BUILD_EXPERIMENTAL", "1") == "1"
@@ -272,13 +271,7 @@ def _setup():
     packages = find_packages(exclude=["tests", "tests.*"])
 
     setup(
-        name="gsplat",
         version=__version__,
-        description=" Python package for differentiable rasterization of gaussians",
-        keywords="gaussian, splatting, cuda",
-        url=URL,
-        download_url=f"{URL}/archive/gsplat-{__version__}.tar.gz",
-        python_requires=">=3.7",
         install_requires=INSTALL_REQUIRES,
         extras_require=get_extras_require(),
         ext_modules=get_extensions() if not BUILD_NO_CUDA else [],

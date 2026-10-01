@@ -1568,6 +1568,289 @@ def rasterization_2dgs(
     )
 
 
+def rasterization_bbsplat(
+    means: Tensor,  # [..., N, 3]
+    quats: Tensor,  # [..., N, 4]
+    scales: Tensor,  # [..., N, 3]
+    opacities: Optional[Tensor],  # [..., N]
+    colors: Tensor,  # [..., (C,) N, D] or [N, K, D] SH coefficients
+    texture_alphas: Tensor,  # [..., N, S, S]
+    texture_colors: Optional[Tensor],  # [..., N, S, S, TC]
+    viewmats: Tensor,  # [..., C, 4, 4]
+    Ks: Tensor,  # [..., C, 3, 3]
+    width: int,
+    height: int,
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    radius_clip: float = 0.0,
+    eps2d: float = 0.3,
+    sh_degree: Optional[int] = None,
+    packed: bool = False,
+    tile_size: int = 16,
+    backgrounds: Optional[Tensor] = None,
+    render_mode: RenderMode = "RGB",
+    sparse_grad: bool = False,
+    distloss: bool = False,
+    depth_mode: Literal["expected", "median"] = "expected",
+    compute_impact: bool = False,
+) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Tensor, Tensor, Dict]:
+    """Rasterize textured 2D billboards (BBSplat, Svitov et al. 2025).
+
+    Each primitive is a 2DGS surfel whose Gaussian falloff is replaced by learned
+    per-primitive textures. The pixel ray is intersected with the splat plane
+    exactly as in :func:`rasterization_2dgs`, giving splat-local coordinates
+    (u, v), where (u, v) in [-1, 1]^2 spans +-scale along the two tangent axes.
+    Then:
+
+    - ``alpha = min(0.99, opacity * texture_alphas(u, v))``
+    - ``color = colors + texture_colors(u, v)``
+
+    Textures are sampled bilinearly like ``F.grid_sample(align_corners=True,
+    padding_mode="zeros")`` (u indexes columns, v rows), so a splat fades to zero
+    within one texel outside its square. The rasterizer does not activate the
+    textures, so apply e.g. a sigmoid to the alpha texture beforehand. Projection
+    culling, ``meta["radii"]`` and tile assignment all use the projected quad of
+    the texels that can reach ALPHA_THRESHOLD (:func:`gsplat.cuda._wrapper.bbsplat_uv_rects`,
+    :func:`gsplat.cuda._wrapper.isect_tiles_2dgs`). There is no screen-space low-pass
+    filter, so ``meta["means2d"]`` receives no gradient. Use
+    ``meta["gradient_2dgs"]`` for densification (``key_for_gradient="gradient_2dgs"``).
+
+    Args:
+        means: Splat centers. [..., N, 3]
+        quats: Splat rotations (wxyz, need not be normalized). [..., N, 4]
+        scales: Splat scales; only the first two are used. [..., N, 3]
+        opacities: Optional opacity multiplier for the alpha texture. None means
+            ones, which is vanilla BBSplat. [..., N]
+        colors: Base colors. [..., (C,) N, D] post-activation, or [N, K, D] SH
+            coefficients when `sh_degree` is set (evaluated as ``max(SH + 0.5, 0)``).
+        texture_alphas: Per-splat alpha textures. [..., N, S, S]
+        texture_colors: Optional per-splat color textures added to the first TC
+            color channels. [..., N, S, S, TC], TC <= D.
+        viewmats: World-to-camera matrices. [..., C, 4, 4]
+        Ks: Camera intrinsics. [..., C, 3, 3]
+        width, height: Image size.
+        near_plane, far_plane, radius_clip, eps2d, sh_degree, packed, tile_size,
+        backgrounds, render_mode, sparse_grad, distloss, depth_mode: Same as
+            :func:`rasterization_2dgs`.
+        compute_impact: If True, ``meta["impacts"]`` holds each splat's total
+            blending weight (sum of alpha * T over all pixels), [..., C, N] or [nnz].
+            BBSplat uses it to weight its texture regularizers.
+
+    Returns:
+        Same tuple as :func:`rasterization_2dgs`: (render_colors, render_alphas,
+        render_normals, surf_normals, render_distort, render_median, meta).
+    """
+    from .cuda._wrapper import (
+        bbsplat_uv_rects,
+        fully_fused_projection_2dgs,
+        isect_tiles_2dgs,
+        rasterize_to_pixels_bbsplat,
+    )
+
+    batch_dims = means.shape[:-2]
+    N = means.shape[-2]
+    C = viewmats.shape[-3]
+    B = math.prod(batch_dims)
+    I = B * C
+    S = texture_alphas.shape[-1]
+    assert texture_alphas.shape == batch_dims + (N, S, S), texture_alphas.shape
+    if texture_colors is not None:
+        assert texture_colors.shape[:-1] == batch_dims + (N, S, S), texture_colors.shape
+    if opacities is None:
+        opacities = torch.ones(batch_dims + (N,), device=means.device)
+    # Splat-local rectangles outside of which no pixel reaches ALPHA_THRESHOLD.
+    uv_rects = bbsplat_uv_rects(
+        texture_alphas.reshape(B * N, S, S), opacities.reshape(B * N)
+    )
+
+    has_color = render_mode_has_color(render_mode)
+    append_depth = render_mode_has_depth_channel(render_mode)
+    assert not distloss or append_depth, "distloss requires a depth render mode"
+
+    proj = fully_fused_projection_2dgs(
+        means,
+        quats,
+        scales,
+        viewmats,
+        Ks,
+        width,
+        height,
+        eps2d,
+        near_plane,
+        far_plane,
+        radius_clip,
+        packed=packed,
+        sparse_grad=sparse_grad,
+        uv_rects=uv_rects.reshape(batch_dims + (N, 4)),
+    )
+    if packed:
+        (
+            batch_ids,
+            camera_ids,
+            gaussian_ids,
+            _indptr,
+            radii,
+            means2d,
+            depths,
+            ray_transforms,
+            normals,
+        ) = proj
+        bids, cids, gids = batch_ids.long(), camera_ids.long(), gaussian_ids.long()
+        opacities = opacities.reshape(B, N)[bids, gids]
+        texture_ids = batch_ids * N + gaussian_ids
+        image_ids = batch_ids * C + camera_ids
+    else:
+        radii, means2d, depths, ray_transforms, normals = proj
+        batch_ids = camera_ids = gaussian_ids = image_ids = None
+        opacities = torch.broadcast_to(opacities[..., None, :], batch_dims + (C, N))
+        texture_ids = torch.broadcast_to(
+            torch.arange(B * N, device=means.device).reshape(B, 1, N), (B, C, N)
+        ).reshape(batch_dims + (C, N))
+
+    densify = torch.zeros_like(means2d, requires_grad=True)
+
+    tile_width = math.ceil(width / float(tile_size))
+    tile_height = math.ceil(height / float(tile_size))
+    tiles_per_gauss, isect_ids, flatten_ids = isect_tiles_2dgs(
+        means2d,
+        radii,
+        depths,
+        ray_transforms,
+        tile_size,
+        tile_width,
+        tile_height,
+        uv_rects=uv_rects[texture_ids.long()],
+        packed=packed,
+        n_images=I,
+        image_ids=image_ids,
+    )
+    isect_offsets = isect_offset_encode(isect_ids, I, tile_width, tile_height)
+    isect_offsets = isect_offsets.reshape(batch_dims + (C, tile_height, tile_width))
+
+    # Assemble feature channels: base colors (+ depth as the last channel).
+    features = None
+    if has_color:
+        if sh_degree is not None:
+            coeffs = colors[gids] if packed else colors
+            features = spherical_harmonics(
+                sh_degree,
+                means,
+                viewmats,
+                coeffs,
+                masks=(radii > 0).all(dim=-1),
+                batch_ids=batch_ids,
+                camera_ids=camera_ids,
+                gaussian_ids=gaussian_ids,
+            )
+            features = torch.clamp_min(features + 0.5, 0.0)
+        elif packed:
+            if colors.dim() == len(batch_dims) + 2:
+                features = colors.reshape(B, N, -1)[bids, gids]
+            else:
+                features = colors.reshape(B, C, N, -1)[bids, cids, gids]
+        elif colors.dim() == len(batch_dims) + 2:
+            features = torch.broadcast_to(
+                colors[..., None, :, :], batch_dims + (C, N, colors.shape[-1])
+            )
+        else:
+            features = colors
+        if texture_colors is not None:
+            assert (
+                texture_colors.shape[-1] <= features.shape[-1]
+            ), "texture_colors has more channels than colors"
+    if append_depth:
+        if features is None:
+            features = depths[..., None]
+        else:
+            features = torch.cat([features, depths[..., None]], dim=-1)
+            if backgrounds is not None:
+                backgrounds = torch.cat(
+                    [backgrounds, torch.zeros_like(backgrounds[..., :1])], dim=-1
+                )
+    assert features is not None, "render_mode renders neither color nor depth"
+
+    (
+        render_colors,
+        render_alphas,
+        render_normals,
+        render_distort,
+        render_median,
+        impacts,
+    ) = rasterize_to_pixels_bbsplat(
+        ray_transforms,
+        features,
+        opacities,
+        normals,
+        densify,
+        texture_alphas.reshape(B * N, S, S),
+        (
+            texture_colors.reshape(B * N, S, S, texture_colors.shape[-1])
+            if texture_colors is not None and has_color
+            else None
+        ),
+        texture_ids,
+        width,
+        height,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+        backgrounds=backgrounds,
+        packed=packed,
+        compute_impact=compute_impact,
+    )
+
+    if render_mode_has_expected_depth(render_mode):
+        expected = render_colors[..., -1:] / render_alphas.clamp_min(1e-10)
+        render_colors = torch.cat([render_colors[..., :-1], expected], dim=-1)
+
+    camtoworlds = torch.linalg.inv(viewmats)
+    surf_normals = None
+    if render_mode_has_depth(render_mode) and has_color:
+        depth_for_normal = (
+            render_median if depth_mode == "median" else render_colors[..., -1:]
+        )
+        surf_normals = depth_to_normal(depth_for_normal, camtoworlds, Ks)
+
+    # camera-space -> world-space normals
+    render_normals = torch.einsum(
+        "...ij,...hwj->...hwi", camtoworlds[..., :3, :3], render_normals
+    )
+
+    meta = {
+        "camera_ids": camera_ids,
+        "gaussian_ids": gaussian_ids,
+        "radii": radii,
+        "means2d": means2d,
+        "depths": depths,
+        "ray_transforms": ray_transforms,
+        "opacities": opacities,
+        "normals": normals,
+        "texture_ids": texture_ids,
+        "tile_width": tile_width,
+        "tile_height": tile_height,
+        "tiles_per_gauss": tiles_per_gauss,
+        "isect_ids": isect_ids,
+        "flatten_ids": flatten_ids,
+        "isect_offsets": isect_offsets,
+        "width": width,
+        "height": height,
+        "tile_size": tile_size,
+        "n_cameras": C,
+        "render_distort": render_distort,
+        "gradient_2dgs": densify,
+        "impacts": impacts if compute_impact else None,
+    }
+    return (
+        render_colors,
+        render_alphas,
+        render_normals,
+        surf_normals,
+        render_distort,
+        render_median,
+        meta,
+    )
+
+
 def rasterization_2dgs_inria_wrapper(
     means: Tensor,  # [N, 3]
     quats: Tensor,  # [N, 4]

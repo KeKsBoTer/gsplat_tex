@@ -87,6 +87,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::dict config;
             config["3dgs"]            = static_cast<bool>(GSPLAT_BUILD_3DGS);
             config["2dgs"]            = static_cast<bool>(GSPLAT_BUILD_2DGS);
+            config["bbsplat"]         = static_cast<bool>(GSPLAT_BUILD_BBSPLAT);
             config["3dgut"]           = static_cast<bool>(GSPLAT_BUILD_3DGUT);
             config["adam"]            = static_cast<bool>(GSPLAT_BUILD_ADAM);
             config["reloc"]           = static_cast<bool>(GSPLAT_BUILD_RELOC);
@@ -1159,10 +1160,16 @@ TORCH_LIBRARY(gsplat, m)
     );
 #endif
 
-#if GSPLAT_BUILD_2DGS
+#if GSPLAT_BUILD_2DGS_PROJECTION
+    m.def(
+        "intersect_tile_2dgs(Tensor means2d, Tensor radii, Tensor depths, Tensor ray_transforms, Tensor? opacities, "
+        "Tensor? uv_rects, Tensor? image_ids, int? n_images, int tile_size, int tile_width, int tile_height, bool "
+        "sort, bool segmented) -> (Tensor, Tensor, Tensor)"
+    );
     m.def(
         "projection_2dgs_fused(Tensor means, Tensor quats, Tensor scales, Tensor viewmats, Tensor Ks, int image_width, "
-        "int image_height, float eps2d, float near_plane, float far_plane, float radius_clip) -> (Tensor, Tensor, "
+        "int image_height, float eps2d, float near_plane, float far_plane, float radius_clip, Tensor? opacities=None, "
+        "Tensor? uv_rects=None) -> (Tensor, Tensor, "
         "Tensor, Tensor, Tensor)"
     );
     m.def(
@@ -1173,7 +1180,8 @@ TORCH_LIBRARY(gsplat, m)
 
     m.def(
         "projection_2dgs_packed(Tensor means, Tensor quats, Tensor scales, Tensor viewmats, Tensor Ks, int "
-        "image_width, int image_height, float near_plane, float far_plane, float radius_clip, bool sparse_grad) -> "
+        "image_width, int image_height, float near_plane, float far_plane, float radius_clip, bool sparse_grad, "
+        "Tensor? opacities=None, Tensor? uv_rects=None) -> "
         "(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
     );
     m.def(
@@ -1182,7 +1190,9 @@ TORCH_LIBRARY(gsplat, m)
         "Tensor ray_transforms, Tensor v_means2d, Tensor v_depths, Tensor v_ray_transforms, Tensor v_normals, bool "
         "viewmats_requires_grad) -> (Tensor, Tensor, Tensor, Tensor?)"
     );
+#endif
 
+#if GSPLAT_BUILD_2DGS
     m.def(
         "rasterize_to_pixels_2dgs(Tensor means2d, Tensor ray_transforms, Tensor colors, Tensor opacities, Tensor "
         "normals, Tensor densify, Tensor? backgrounds, Tensor? masks, int image_width, int image_height, int "
@@ -1209,6 +1219,24 @@ TORCH_LIBRARY(gsplat, m)
         "distloss, int? sh_degree, str render_mode, str depth_mode) -> (Tensor, Tensor, Tensor, Tensor?, Tensor, "
         "Tensor, Tensor, Tensor?, Tensor?, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, "
         "Tensor, Tensor, int, int, int)"
+    );
+#endif
+
+#if GSPLAT_BUILD_BBSPLAT
+    m.def("bbsplat_uv_rects(Tensor texture_alphas, Tensor? opacities) -> Tensor");
+    m.def(
+        "rasterize_to_pixels_bbsplat(Tensor ray_transforms, Tensor colors, Tensor opacities, Tensor normals, Tensor "
+        "densify, Tensor texture_alphas, Tensor? texture_colors, Tensor texture_ids, Tensor? backgrounds, Tensor? "
+        "masks, int image_width, int image_height, int tile_size, Tensor tile_offsets, Tensor flatten_ids, bool "
+        "packed, bool compute_impact) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+    );
+    m.def(
+        "rasterize_to_pixels_bbsplat_bwd(Tensor ray_transforms, Tensor colors, Tensor opacities, Tensor normals, "
+        "Tensor densify, Tensor texture_alphas, Tensor? texture_colors, Tensor texture_ids, Tensor? backgrounds, "
+        "Tensor? masks, Tensor tile_offsets, Tensor flatten_ids, Tensor render_colors, Tensor render_alphas, Tensor "
+        "last_ids, Tensor median_ids, int image_width, int image_height, int tile_size, Tensor v_render_colors, Tensor "
+        "v_render_alphas, Tensor v_render_normals, Tensor v_render_distort, Tensor v_render_median, bool "
+        "compute_v_backgrounds) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?, Tensor?)"
     );
 #endif
 

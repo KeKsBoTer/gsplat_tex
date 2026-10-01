@@ -32,9 +32,7 @@ class GsplatRenderTabState(RenderTabState):
     radius_clip: float = 0.0
     eps2d: float = 0.3
     backgrounds: Tuple[float, float, float] = (0.0, 0.0, 0.0)
-    render_mode: Literal[
-        "rgb", "depth(accumulated)", "depth(expected)", "alpha"
-    ] = "rgb"
+    render_mode: Literal["rgb", "depth", "normal", "alpha"] = "rgb"
     normalize_nearfar: bool = False
     inverse: bool = False
     colormap: Literal[

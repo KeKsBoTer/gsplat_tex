@@ -1258,7 +1258,7 @@ ProjectionEWA3DGSPackedResult projection_ewa_3dgs_packed(
 
 #endif
 
-#if GSPLAT_BUILD_2DGS
+#if GSPLAT_BUILD_2DGS_PROJECTION
 
 namespace
 {
@@ -1310,6 +1310,40 @@ namespace
     }
 } // namespace
 
+namespace
+{
+    // Validates the optional culling inputs of the 2DGS projection: per-Gaussian
+    // opacities (2DGS) or uv rectangles (BBSplat), see Footprint2DGS.cuh.
+    void check_projection_2dgs_cull_inputs(
+        const at::Tensor &means, const at::optional<at::Tensor> &opacities, const at::optional<at::Tensor> &uv_rects
+    )
+    {
+        TORCH_CHECK(
+            !(opacities.has_value() && uv_rects.has_value()),
+            "projection_2dgs takes at most one of opacities (2DGS) and uv_rects (BBSplat)"
+        );
+        const auto lead = means.sizes().slice(0, means.dim() - 1); // [..., N]
+        if(opacities.has_value())
+        {
+            CHECK_INPUT(opacities.value());
+            TORCH_CHECK(opacities->scalar_type() == at::kFloat, "opacities must be float32");
+            TORCH_CHECK(opacities->sizes() == lead, "opacities must have shape [..., N], got ", opacities->sizes());
+        }
+        if(uv_rects.has_value())
+        {
+            CHECK_INPUT(uv_rects.value());
+            TORCH_CHECK(uv_rects->scalar_type() == at::kFloat, "uv_rects must be float32");
+            TORCH_CHECK(
+                uv_rects->dim() == means.dim()
+                    && uv_rects->size(-1) == 4
+                    && uv_rects->sizes().slice(0, means.dim() - 1) == lead,
+                "uv_rects must have shape [..., N, 4], got ",
+                uv_rects->sizes()
+            );
+        }
+    }
+} // namespace
+
 template<>
 struct TorchArgDef<Projection2DGSFusedResult>
 {
@@ -1344,10 +1378,13 @@ Projection2DGSFusedFwdResult projection_2dgs_fused_fwd(
     double eps2d,
     double near_plane,
     double far_plane,
-    double radius_clip
+    double radius_clip,
+    const at::optional<at::Tensor> &opacities, // [..., N]
+    const at::optional<at::Tensor> &uv_rects   // [..., N, 4]
 )
 {
     check_projection_2dgs_inputs(means, quats, scales, viewmats, Ks);
+    check_projection_2dgs_cull_inputs(means, opacities, uv_rects);
 
     DEVICE_GUARD(means);
 
@@ -1388,6 +1425,8 @@ Projection2DGSFusedFwdResult projection_2dgs_fused_fwd(
         near_plane,
         far_plane,
         radius_clip,
+        opacities,
+        uv_rects,
         // outputs
         radii,
         means2d,
@@ -1480,13 +1519,19 @@ Projection2DGSFusedBwdResult projection_2dgs_fused_bwd(
     CHECK_INPUT(radii);
     CHECK_INPUT(ray_transforms);
     CHECK_DENSE(grad.means2d);
-    CHECK_INPUT(grad.means2d);
     CHECK_DENSE(grad.depths);
-    CHECK_INPUT(grad.depths);
     CHECK_DENSE(grad.normals);
-    CHECK_INPUT(grad.normals);
     CHECK_DENSE(grad.ray_transforms);
-    CHECK_INPUT(grad.ray_transforms);
+    // Depth grads arrive as a strided slice when depth is rendered as an
+    // extra channel (e.g. RGB+ED), so normalize the layout here.
+    at::Tensor grad_means2d        = grad.means2d.contiguous();
+    at::Tensor grad_depths         = grad.depths.contiguous();
+    at::Tensor grad_normals        = grad.normals.contiguous();
+    at::Tensor grad_ray_transforms = grad.ray_transforms.contiguous();
+    CHECK_INPUT(grad_means2d);
+    CHECK_INPUT(grad_depths);
+    CHECK_INPUT(grad_normals);
+    CHECK_INPUT(grad_ray_transforms);
 
     at::Tensor v_means  = at::zeros_like(means);
     at::Tensor v_quats  = at::zeros_like(quats);
@@ -1508,10 +1553,10 @@ Projection2DGSFusedBwdResult projection_2dgs_fused_bwd(
         image_height,
         radii,
         ray_transforms,
-        grad.means2d,
-        grad.depths,
-        grad.normals,
-        grad.ray_transforms,
+        grad_means2d,
+        grad_depths,
+        grad_normals,
+        grad_ray_transforms,
         viewmats_requires_grad,
         // outputs
         v_means,
@@ -1539,7 +1584,9 @@ Projection2DGSFusedFwdResult projection_2dgs_fused(
     double eps2d,
     double near_plane,
     double far_plane,
-    double radius_clip
+    double radius_clip,
+    const at::optional<at::Tensor> &opacities,
+    const at::optional<at::Tensor> &uv_rects
 )
 {
     // Invoke the op through the dispatcher so its registered autograd is
@@ -1556,7 +1603,9 @@ Projection2DGSFusedFwdResult projection_2dgs_fused(
         eps2d,
         near_plane,
         far_plane,
-        radius_clip
+        radius_clip,
+        opacities,
+        uv_rects
     );
 }
 
@@ -1608,11 +1657,14 @@ Projection2DGSPackedFwdResult projection_2dgs_packed_fwd(
     double near_plane,
     double far_plane,
     double radius_clip,
-    bool sparse_grad
+    bool sparse_grad,
+    const at::optional<at::Tensor> &opacities, // [..., N]
+    const at::optional<at::Tensor> &uv_rects   // [..., N, 4]
 )
 {
     DEVICE_GUARD(means);
     check_projection_2dgs_inputs(means, quats, scales, viewmats, Ks);
+    check_projection_2dgs_cull_inputs(means, opacities, uv_rects);
 
     uint32_t N = means.size(-2);                                                  // number of gaussians
     uint32_t B = c10::multiply_integers(means.sizes().slice(0, means.dim() - 2)); // number of batches
@@ -1641,6 +1693,8 @@ Projection2DGSPackedFwdResult projection_2dgs_packed_fwd(
             near_plane,
             far_plane,
             radius_clip,
+            opacities,
+            uv_rects,
             c10::nullopt, // block_accum
             // outputs
             block_cnts,
@@ -1687,6 +1741,8 @@ Projection2DGSPackedFwdResult projection_2dgs_packed_fwd(
             near_plane,
             far_plane,
             radius_clip,
+            opacities,
+            uv_rects,
             block_accum,
             // outputs
             c10::nullopt, // block_cnts
@@ -1793,13 +1849,19 @@ Projection2DGSPackedBwdResult projection_2dgs_packed_bwd(
     DEVICE_GUARD(means);
     check_projection_2dgs_inputs(means, quats, scales, viewmats, Ks);
     CHECK_DENSE(grad.means2d);
-    CHECK_INPUT(grad.means2d);
     CHECK_DENSE(grad.depths);
-    CHECK_INPUT(grad.depths);
     CHECK_DENSE(grad.normals);
-    CHECK_INPUT(grad.normals);
     CHECK_DENSE(grad.ray_transforms);
-    CHECK_INPUT(grad.ray_transforms);
+    // Depth grads arrive as a strided slice when depth is rendered as an
+    // extra channel (e.g. RGB+ED), so normalize the layout here.
+    at::Tensor grad_means2d        = grad.means2d.contiguous();
+    at::Tensor grad_depths         = grad.depths.contiguous();
+    at::Tensor grad_normals        = grad.normals.contiguous();
+    at::Tensor grad_ray_transforms = grad.ray_transforms.contiguous();
+    CHECK_INPUT(grad_means2d);
+    CHECK_INPUT(grad_depths);
+    CHECK_INPUT(grad_normals);
+    CHECK_INPUT(grad_ray_transforms);
 
     auto opt     = means.options();
     uint32_t nnz = batch_ids.size(0);
@@ -1837,10 +1899,10 @@ Projection2DGSPackedBwdResult projection_2dgs_packed_bwd(
         gaussian_ids,
         ray_transforms,
         // grad outputs
-        grad.means2d,
-        grad.depths,
-        grad.ray_transforms,
-        grad.normals,
+        grad_means2d,
+        grad_depths,
+        grad_ray_transforms,
+        grad_normals,
         sparse_grad,
         // outputs
         v_means,
@@ -1881,7 +1943,9 @@ Projection2DGSPackedResult projection_2dgs_packed(
     double near_plane,
     double far_plane,
     double radius_clip,
-    bool sparse_grad
+    bool sparse_grad,
+    const at::optional<at::Tensor> &opacities,
+    const at::optional<at::Tensor> &uv_rects
 )
 {
     // Invoke the op through the dispatcher so its registered autograd is
@@ -1898,7 +1962,9 @@ Projection2DGSPackedResult projection_2dgs_packed(
         near_plane,
         far_plane,
         radius_clip,
-        sparse_grad
+        sparse_grad,
+        opacities,
+        uv_rects
     );
 }
 
@@ -2200,7 +2266,7 @@ void register_projection_cuda_impl(torch::Library &m)
     m.impl("projection_ewa_3dgs_packed_bwd", to_torch_op<&projection_ewa_3dgs_packed_bwd>);
 #endif
 
-#if GSPLAT_BUILD_2DGS
+#if GSPLAT_BUILD_2DGS_PROJECTION
     m.impl("projection_2dgs_fused", to_torch_op<&projection_2dgs_fused_fwd>);
     m.impl("projection_2dgs_fused_bwd", to_torch_op<&projection_2dgs_fused_bwd>);
     m.impl("projection_2dgs_packed", to_torch_op<&projection_2dgs_packed_fwd>);

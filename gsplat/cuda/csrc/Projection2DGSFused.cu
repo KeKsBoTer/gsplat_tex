@@ -18,7 +18,7 @@
 
 #include "Config.h"
 
-#if GSPLAT_BUILD_2DGS
+#if GSPLAT_BUILD_2DGS_PROJECTION
 
 #    include <ATen/Dispatch.h>
 #    include <ATen/core/Tensor.h>
@@ -27,6 +27,7 @@
 #    include <cooperative_groups.h>
 
 #    include "Common.h"
+#    include "Footprint2DGS.cuh"
 #    include "Projection.h"
 #    include "Projection2DGS.cuh" // Utils for 2DGS Projection
 #    include "Utils.cuh"
@@ -57,6 +58,8 @@ __global__ void projection_2dgs_fused_fwd_kernel(
     const scalar_t far_plane,              // Far clipping plane (for finite range used in z sorting)
     const scalar_t radius_clip,            // Radius clipping threshold (through away small
                                            // primitives)
+    const float *__restrict__ opacities,   // [B, N] optional: opacity-aware culling (2DGS)
+    const float *__restrict__ uv_rects,    // [B, N, 4] optional: texture-aware culling (BBSplat)
     // outputs
     int32_t *__restrict__ radii,           // [B, C, N, 2]   The maximum radius of the projected
                                            // Gaussians in pixel unit. Int32 tensor.
@@ -228,10 +231,31 @@ __global__ void projection_2dgs_fused_fwd_kernel(
     const vec2 half_extend = mean2d * mean2d - temp;
 
     // ==============================================
-    const float radius_x = ceil(GAUSSIAN_EXTEND * sqrt(max(1e-4, half_extend.x)));
-    const float radius_y = ceil(GAUSSIAN_EXTEND * sqrt(max(1e-4, half_extend.y)));
+    float2 radius = {
+        ceil(GAUSSIAN_EXTEND * sqrt(max(1e-4, half_extend.x))),
+        ceil(GAUSSIAN_EXTEND * sqrt(max(1e-4, half_extend.y))),
+    };
+    // Optionally tighten the cull box to the exact (opacity- or
+    // texture-aware) footprint, see Footprint2DGS.cuh.
+    const float H[9]  = {M0.x, M0.y, M0.z, M1.x, M1.y, M1.z, M2.x, M2.y, M2.z};
+    const int64_t pid = (int64_t)bid * N + gid;
+    float2 bbox_min, bbox_max;
+    if(!footprint2dgs::projection_bounds(
+           H,
+           {mean2d.x, mean2d.y},
+           opacities != nullptr ? opacities + pid : nullptr,
+           uv_rects != nullptr ? uv_rects + pid * 4 : nullptr,
+           radius,
+           bbox_min,
+           bbox_max
+       ))
+    {
+        radii[idx * 2]     = 0;
+        radii[idx * 2 + 1] = 0;
+        return;
+    }
 
-    if(radius_x <= radius_clip && radius_y <= radius_clip)
+    if(radius.x <= radius_clip && radius.y <= radius_clip)
     {
         radii[idx * 2]     = 0;
         radii[idx * 2 + 1] = 0;
@@ -240,10 +264,7 @@ __global__ void projection_2dgs_fused_fwd_kernel(
 
     // CULLING STEP:
     // mask out gaussians outside the image region
-    if(mean2d.x + radius_x <= 0
-       || mean2d.x - radius_x >= image_width
-       || mean2d.y + radius_y <= 0
-       || mean2d.y - radius_y >= image_height)
+    if(bbox_max.x <= 0 || bbox_min.x >= image_width || bbox_max.y <= 0 || bbox_min.y >= image_height)
     {
         radii[idx * 2]     = 0;
         radii[idx * 2 + 1] = 0;
@@ -257,8 +278,8 @@ __global__ void projection_2dgs_fused_fwd_kernel(
     normal          *= multipler;
 
     // write to outputs
-    radii[idx * 2]       = (int32_t)radius_x;
-    radii[idx * 2 + 1]   = (int32_t)radius_y;
+    radii[idx * 2]       = (int32_t)radius.x;
+    radii[idx * 2 + 1]   = (int32_t)radius.y;
     means2d[idx * 2]     = mean2d.x;
     means2d[idx * 2 + 1] = mean2d.y;
     depths[idx]          = mean_c.z;
@@ -292,6 +313,8 @@ void launch_projection_2dgs_fused_fwd_kernel(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
+    const at::optional<at::Tensor> opacities, // [..., N]
+    const at::optional<at::Tensor> uv_rects,  // [..., N, 4]
     // outputs
     at::Tensor radii,          // [..., C, N, 2]
     at::Tensor means2d,        // [..., C, N, 2]
@@ -329,6 +352,8 @@ void launch_projection_2dgs_fused_fwd_kernel(
         near_plane,
         far_plane,
         radius_clip,
+        opacities.has_value() ? opacities.value().const_data_ptr<float>() : nullptr,
+        uv_rects.has_value() ? uv_rects.value().const_data_ptr<float>() : nullptr,
         radii.data_ptr<int32_t>(),
         means2d.data_ptr<float>(),
         depths.data_ptr<float>(),

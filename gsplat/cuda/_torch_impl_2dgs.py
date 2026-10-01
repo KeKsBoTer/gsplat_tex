@@ -21,7 +21,13 @@ import torch
 from torch import Tensor
 
 from gsplat.cuda._math import _quat_scale_to_matrix
-from gsplat.cuda._constants import MAX_ALPHA
+from gsplat.cuda._constants import (
+    ALPHA_THRESHOLD,
+    FILTER_INV_SQUARE_2DGS,
+    GAUSSIAN_EXTEND,
+    MAX_ALPHA,
+    TRANSMITTANCE_THRESHOLD,
+)
 
 
 def _fully_fused_projection_2dgs(
@@ -332,3 +338,243 @@ def _rasterize_to_pixels_2dgs(
         )
 
     return render_colors, render_alphas, render_normals
+
+
+def _rasterize_to_pixels_bbsplat(
+    ray_transforms: Tensor,  # [..., N, 3, 3]
+    colors: Tensor,  # [..., N, channels]
+    opacities: Tensor,  # [..., N]
+    normals: Tensor,  # [..., N, 3]
+    texture_alphas: Tensor,  # [M, S, S]
+    texture_colors: Optional[Tensor],  # [M, S, S, TC]
+    texture_ids: Tensor,  # [..., N]
+    radii: Tensor,  # [..., N, 2]
+    depths: Tensor,  # [..., N]
+    image_width: int,
+    image_height: int,
+    backgrounds: Optional[Tensor] = None,  # [..., channels]
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """PyTorch implementation of `gsplat.cuda._wrapper.rasterize_to_pixels_bbsplat()`.
+
+    Composites every visible splat (``radii > 0``) over the full image, front to
+    back by ``depths``, instead of using tile intersections. This matches the
+    CUDA op as long as the projected tile bounds cover each splat's textured
+    footprint. Textures are sampled with ``F.grid_sample(align_corners=True)``,
+    which is the convention the CUDA kernel implements. It is slow and meant for
+    testing on small images, and it relies on autograd for the backward pass.
+    """
+    import torch.nn.functional as F
+
+    image_dims = ray_transforms.shape[:-3]
+    N = ray_transforms.shape[-3]
+    I = math.prod(image_dims)
+    channels = colors.shape[-1]
+    device = ray_transforms.device
+
+    ray_transforms = ray_transforms.reshape(I, N, 3, 3)
+    colors = colors.reshape(I, N, channels)
+    opacities = opacities.reshape(I, N)
+    normals = normals.reshape(I, N, 3)
+    texture_ids = texture_ids.reshape(I, N)
+    radii = radii.reshape(I, N, 2)
+    depths = depths.reshape(I, N)
+
+    ys, xs = torch.meshgrid(
+        torch.arange(image_height, device=device, dtype=torch.float32) + 0.5,
+        torch.arange(image_width, device=device, dtype=torch.float32) + 0.5,
+        indexing="ij",
+    )  # [H, W]
+    pix = torch.stack([xs, ys], dim=-1)  # [H, W, 2]
+
+    def sample(texture: Tensor, grid: Tensor) -> Tensor:
+        # texture [S, S, K] -> [H, W, K]
+        out = F.grid_sample(
+            texture.permute(2, 0, 1)[None],
+            grid[None],
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        return out[0].permute(1, 2, 0)
+
+    out_colors, out_alphas, out_normals = [], [], []
+    for i in range(I):
+        T = torch.ones(image_height, image_width, 1, device=device)
+        done = torch.zeros(
+            image_height, image_width, 1, dtype=torch.bool, device=device
+        )
+        render_c = torch.zeros(image_height, image_width, channels, device=device)
+        render_n = torch.zeros(image_height, image_width, 3, device=device)
+
+        visible = (radii[i] > 0).all(dim=-1)
+        order = torch.argsort(depths[i], stable=True)
+        for g in order[visible[order]].tolist():
+            M = ray_transforms[i, g]
+            h_u = pix[..., :1] * M[2] - M[0]  # [H, W, 3]
+            h_v = pix[..., 1:] * M[2] - M[1]
+            cross = torch.cross(h_u, h_v, dim=-1)
+            uv = cross[..., :2] / cross[..., 2:]  # [H, W, 2]
+            # keep grid_sample away from inf/nan; |uv| > 2 samples zero anyway
+            uv = torch.nan_to_num(uv, nan=1e6, posinf=1e6, neginf=-1e6).clamp(-1e6, 1e6)
+
+            tid = int(texture_ids[i, g])
+            tex_alpha = sample(texture_alphas[tid][..., None], uv)  # [H, W, 1]
+            alpha = torch.clamp_max(opacities[i, g] * tex_alpha, MAX_ALPHA)
+            skip = alpha < 1.0 / 255.0
+            done = done | (~skip & (T * (1.0 - alpha) <= TRANSMITTANCE_THRESHOLD))
+            alpha = torch.where(skip | done, torch.zeros_like(alpha), alpha)
+
+            c = colors[i, g].expand(image_height, image_width, channels)
+            if texture_colors is not None:
+                tex_c = sample(texture_colors[tid], uv)
+                c = c + F.pad(tex_c, (0, channels - tex_c.shape[-1]))
+            vis = alpha * T
+            render_c = render_c + vis * c
+            render_n = render_n + vis * normals[i, g]
+            T = T * (1.0 - alpha)
+
+        out_colors.append(render_c)
+        out_alphas.append(1.0 - T)
+        out_normals.append(render_n)
+
+    render_colors = torch.stack(out_colors).reshape(
+        image_dims + (image_height, image_width, channels)
+    )
+    render_alphas = torch.stack(out_alphas).reshape(
+        image_dims + (image_height, image_width, 1)
+    )
+    render_normals = torch.stack(out_normals).reshape(
+        image_dims + (image_height, image_width, 3)
+    )
+    if backgrounds is not None:
+        render_colors = render_colors + backgrounds[..., None, None, :] * (
+            1.0 - render_alphas
+        )
+    return render_colors, render_alphas, render_normals
+
+
+def _isect_tiles_2dgs(
+    means2d: Tensor,  # [..., N, 2]
+    radii: Tensor,  # [..., N, 2]
+    ray_transforms: Tensor,  # [..., N, 3, 3]
+    tile_size: int,
+    tile_width: int,
+    tile_height: int,
+    opacities: Optional[Tensor] = None,  # [..., N]
+    uv_rects: Optional[Tensor] = None,  # [..., N, 4]
+    samples_per_pixel: int = 4,
+    chunk: int = 64,
+) -> Tuple[Tensor, Tensor]:
+    """Pytorch reference for `gsplat.cuda._wrapper.isect_tiles_2dgs()`.
+
+    Evaluates each primitive's footprint the way the rasterizers do (ray-splat
+    intersection, plus the low-pass disk for 2DGS) on a grid with
+    `samples_per_pixel` samples per pixel that includes the tile borders, and
+    marks every tile containing a covered sample.
+
+    Returns:
+        A tuple:
+
+        - **Tile masks**. Bool [..., N, tile_height, tile_width].
+        - **In front**. Bool [..., N]: whether the footprint lies in front of the
+          camera, i.e. the kernel tests the exact footprint rather than the
+          radii box fallback.
+    """
+    assert (opacities is None) != (uv_rects is None)
+    lead = means2d.shape[:-1]
+    device = means2d.device
+    M = math.prod(lead)
+    H = ray_transforms.reshape(M, 3, 3).double()
+    H = H / H[:, 2:3, 2:3]
+    mean2d = means2d.reshape(M, 2).double()
+    visible = (radii.reshape(M, 2) > 0).all(dim=-1)
+
+    if opacities is not None:
+        opac = opacities.reshape(M).double()
+        visible &= opac >= ALPHA_THRESHOLD
+        t = torch.clamp(
+            2.0 * torch.log(opac.clamp_min(1e-30) / ALPHA_THRESHOLD),
+            max=GAUSSIAN_EXTEND**2,
+        )
+        in_front = t * (H[:, 2, 0] ** 2 + H[:, 2, 1] ** 2) < 1.0 - 1e-3
+    else:
+        rects = uv_rects.reshape(M, 4).double()
+        visible &= (rects[:, 0] <= rects[:, 1]) & (rects[:, 2] <= rects[:, 3])
+        us = rects[:, [0, 1, 1, 0]]
+        vs = rects[:, [2, 2, 3, 3]]
+        w = H[:, 2, 0:1] * us + H[:, 2, 1:2] * vs + H[:, 2, 2:3]
+        in_front = (w > 1e-3).all(dim=-1)
+
+    T = tile_size * samples_per_pixel
+    xs = torch.arange(tile_width * T + 1, device=device, dtype=torch.float64)
+    ys = torch.arange(tile_height * T + 1, device=device, dtype=torch.float64)
+    xs = xs / samples_per_pixel
+    ys = ys / samples_per_pixel
+    py, px = torch.meshgrid(ys, xs, indexing="ij")  # [Hs, Ws]
+
+    masks = torch.zeros(M, tile_height, tile_width, dtype=torch.bool, device=device)
+    for start in range(0, M, chunk):
+        sl = slice(start, min(start + chunk, M))
+        h = H[sl, :, None, None, :]  # [m, 3, 1, 1, 3]
+        h_u = px[..., None] * h[:, 2] - h[:, 0]  # [m, Hs, Ws, 3]
+        h_v = py[..., None] * h[:, 2] - h[:, 1]
+        cross = torch.linalg.cross(h_u, h_v)
+        s = cross[..., :2] / cross[..., 2:3]
+        if opacities is not None:
+            tt = t[sl, None, None]
+            d = torch.stack([px, py], dim=-1) - mean2d[sl, None, None, :]
+            covered = ((s * s).sum(dim=-1) <= tt) | (
+                FILTER_INV_SQUARE_2DGS * (d * d).sum(dim=-1) <= tt
+            )
+        else:
+            r = rects[sl, None, None, :]
+            covered = (
+                (s[..., 0] >= r[..., 0])
+                & (s[..., 0] <= r[..., 1])
+                & (s[..., 1] >= r[..., 2])
+                & (s[..., 1] <= r[..., 3])
+            )
+        covered &= visible[sl, None, None]
+        # A sample on a tile border counts for both adjacent tiles.
+        for i in range(tile_height):
+            rows = covered[:, i * T : (i + 1) * T + 1]
+            for j in range(tile_width):
+                masks[sl, i, j] = rows[:, :, j * T : (j + 1) * T + 1].any(dim=(1, 2))
+    return (
+        masks.reshape(lead + (tile_height, tile_width)),
+        (in_front & visible).reshape(lead),
+    )
+
+
+def _bbsplat_uv_rects(
+    texture_alphas: Tensor,  # [..., S, S]
+    opacities: Optional[Tensor] = None,  # [...]
+) -> Tensor:
+    """Pytorch implementation of `gsplat.cuda._wrapper.bbsplat_uv_rects()`."""
+    S = texture_alphas.shape[-1]
+    assert S >= 2, "BBSplat textures need S >= 2"
+    # The bound must not drop texels that round up to ALPHA_THRESHOLD in the
+    # rasterizer, hence the small slack.
+    thr = ALPHA_THRESHOLD * (1.0 - 1e-4)
+    if opacities is not None:
+        thr = thr / opacities.clamp_min(1e-30)[..., None]
+    cols = texture_alphas.amax(dim=-2) >= thr  # [..., S] (u)
+    rows = texture_alphas.amax(dim=-1) >= thr  # [..., S] (v)
+
+    idx = torch.arange(S, device=texture_alphas.device, dtype=torch.float32)
+    big = float(S)
+
+    def span(m: Tensor) -> Tuple[Tensor, Tensor]:
+        lo = torch.where(m, idx, big).amin(dim=-1)
+        hi = torch.where(m, idx, -big).amax(dim=-1)
+        # texel x sits at u = 2x / (S - 1) - 1 and its bilinear support is (x - 1, x + 1)
+        scale = 2.0 / (S - 1)
+        return (lo - 1.0) * scale - 1.0, (hi + 1.0) * scale - 1.0
+
+    u0, u1 = span(cols)
+    v0, v1 = span(rows)
+    rects = torch.stack([u0, u1, v0, v1], dim=-1)
+    empty = ~cols.any(dim=-1)
+    return torch.where(
+        empty[..., None], rects.new_tensor([1.0, -1.0, 1.0, -1.0]), rects
+    ).float()

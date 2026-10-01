@@ -25,3 +25,10 @@ TRANSMITTANCE_THRESHOLD = 1e-4
 # Floor for the antialiased compensation factor (sqrt(det_orig / det_blur)).
 # Prevents compensation from reaching zero for extremely small Gaussians.
 MIN_COMPENSATION = 0.005
+
+# Multiple of the projected standard deviation that bounds a Gaussian's 2D
+# extent (GAUSSIAN_EXTEND in Common.h; 3.33^2 ~= 2 ln(255)).
+GAUSSIAN_EXTEND = 3.33
+# Inverse squared radius of the 2DGS screen-space low-pass filter
+# (FILTER_INV_SQUARE_2DGS in Rasterization.h).
+FILTER_INV_SQUARE_2DGS = 2.0

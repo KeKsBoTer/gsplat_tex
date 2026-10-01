@@ -120,6 +120,142 @@ namespace
         }
     }
 
+    // Flattened image count of an intersect_tile* call, after checking that the
+    // (image, tile) ids fit into the 32-bit key prefix.
+    int64_t intersect_image_count(
+        const at::Tensor &means2d, // [..., N, 2] or [nnz, 2]
+        const std::optional<int64_t> &n_images,
+        const bool packed,
+        const bool segmented,
+        const uint32_t n_tiles
+    )
+    {
+        // For the non-packed [..., N, 2] layout it is the product of the
+        // leading image dims; the packed [nnz, 2] layout flattens those dims
+        // away, so the caller must supply it.
+        int64_t I;
+        if(packed)
+        {
+            TORCH_CHECK(n_images.has_value(), "n_images is required when means2d is packed ([nnz, 2]).");
+            I = n_images.value();
+        }
+        else
+        {
+            I = c10::multiply_integers(means2d.sizes().slice(0, means2d.dim() - 2));
+        }
+
+        // packed-mode `offsets` (below) reduce a 1-D [nnz] tiles_per_gauss and
+        // collapse to a single [0, total] segment, so a per-image segmented sort
+        // would index past the 2-entry offsets buffer. Reject until packed offsets
+        // are built per image.
+        TORCH_CHECK(!(packed && segmented), "segmented sort is not supported for packed inputs");
+
+        // the number of bits needed to encode the image id and tile id
+        const uint32_t image_n_bits = bits_for_count(I);
+        const uint32_t tile_n_bits  = bits_for_count(n_tiles);
+        // the first 32 bits are used for the image id and tile id altogether, so
+        // check if we have enough bits for them.
+        TORCH_CHECK(
+            image_n_bits + tile_n_bits <= 32,
+            "intersect_tile: (image, tile) id packing needs ",
+            image_n_bits + tile_n_bits,
+            " bits but only 32 are available (I=",
+            I,
+            ", n_tiles=",
+            n_tiles,
+            ")."
+        );
+        return I;
+    }
+
+    // Runs the two passes of a tile-intersection kernel and optionally sorts the
+    // result. launch(cum_tiles_per_gauss, tiles_per_gauss, isect_ids, flatten_ids)
+    // runs one pass: the first pass (cum_tiles_per_gauss == nullopt) writes the
+    // per-primitive tile counts, the second writes the intersection keys.
+    template<typename LaunchFn>
+    TileIntersectResult run_intersect_tile_passes(
+        const at::Tensor &depths, // [..., N] or [nnz]
+        const int64_t I,
+        const uint32_t n_tiles,
+        const bool sort,
+        const bool segmented,
+        LaunchFn &&launch
+    )
+    {
+        auto opt                    = depths.options();
+        const int64_t n_elements    = depths.numel();
+        const uint32_t image_n_bits = bits_for_count(I);
+        const uint32_t tile_n_bits  = bits_for_count(n_tiles);
+
+        // first pass: compute number of tiles per gaussian
+        // TODO: This first pass can be avoided, see todo comment in intersect_tile_lidar_kernel.
+        at::Tensor tiles_per_gauss = at::empty_like(depths, opt.dtype(at::kInt));
+        int64_t n_isects;
+        at::Tensor cum_tiles_per_gauss;
+        at::Tensor offsets;
+        if(n_elements)
+        {
+            launch(c10::nullopt, at::optional<at::Tensor>(tiles_per_gauss), c10::nullopt, c10::nullopt);
+            // Explicit int64 to match the kernel's int64 read of cum_tiles_per_gauss.
+            cum_tiles_per_gauss = at::cumsum(tiles_per_gauss.view({-1}), 0, at::kLong);
+            n_isects            = cum_tiles_per_gauss[-1].item<int64_t>();
+            if(segmented)
+            {
+                // offsets in the isect_ids and flatten_ids
+                offsets = at::cumsum(at::sum(tiles_per_gauss, -1).view({-1}), 0, at::kLong);
+                offsets = at::cat({at::tensor({0}, opt.dtype(at::kLong)), offsets});
+            }
+        }
+        else
+        {
+            n_isects = 0;
+        }
+
+        // second pass: compute isect_ids and flatten_ids as a packed tensor
+        at::Tensor isect_ids   = at::empty({n_isects}, opt.dtype(at::kLong));
+        at::Tensor flatten_ids = at::empty({n_isects}, opt.dtype(at::kInt));
+        if(n_isects)
+        {
+            launch(
+                at::optional<at::Tensor>(cum_tiles_per_gauss),
+                c10::nullopt,
+                at::optional<at::Tensor>(isect_ids),
+                at::optional<at::Tensor>(flatten_ids)
+            );
+        }
+
+        // optionally sort the Gaussians by isect_ids
+        if(n_isects && sort)
+        {
+            at::Tensor isect_ids_sorted   = at::empty_like(isect_ids);
+            at::Tensor flatten_ids_sorted = at::empty_like(flatten_ids);
+            if(segmented)
+            {
+                segmented_radix_sort_double_buffer(
+                    n_isects,
+                    I,
+                    image_n_bits,
+                    tile_n_bits,
+                    offsets,
+                    isect_ids,
+                    flatten_ids,
+                    isect_ids_sorted,
+                    flatten_ids_sorted
+                );
+            }
+            else
+            {
+                radix_sort_double_buffer(
+                    n_isects, image_n_bits, tile_n_bits, isect_ids, flatten_ids, isect_ids_sorted, flatten_ids_sorted
+                );
+            }
+            return {
+                .tiles_per_gauss = tiles_per_gauss, .isect_ids = isect_ids_sorted, .flatten_ids = flatten_ids_sorted
+            };
+        }
+        return {.tiles_per_gauss = tiles_per_gauss, .isect_ids = isect_ids, .flatten_ids = flatten_ids};
+    }
+
 #if GSPLAT_BUILD_3DGUT
     // Validates intersect_tile_lidar inputs. Each checked assumption is a
     // precondition of the lidar tile-intersection kernel.
@@ -185,148 +321,141 @@ TileIntersectResult intersect_tile(
 {
     DEVICE_GUARD(means2d);
 
-    auto opt            = depths.options();
-    uint32_t n_elements = means2d.numel() / 2;
-    bool packed         = means2d.dim() == 2;
+    bool packed = means2d.dim() == 2;
     check_intersect_tile_inputs(means2d, radii, depths, conics, opacities, image_ids, gaussian_ids, packed);
+    const uint32_t n_tiles = tile_width * tile_height;
+    const int64_t I        = intersect_image_count(means2d, n_images, packed, segmented, n_tiles);
 
-    // Flattened image count. For the non-packed [..., N, 2] layout it is the
-    // product of the leading image dims; the packed [nnz, 2] layout flattens
-    // those dims away, so the caller must supply it.
-    int64_t I;
-    if(packed)
-    {
-        TORCH_CHECK(n_images.has_value(), "n_images is required when means2d is packed ([nnz, 2]).");
-        I = n_images.value();
-    }
-    else
-    {
-        I = c10::multiply_integers(means2d.sizes().slice(0, means2d.dim() - 2));
-    }
-
-    // packed-mode `offsets` (below) reduce a 1-D [nnz] tiles_per_gauss and
-    // collapse to a single [0, total] segment, so a per-image segmented sort
-    // would index past the 2-entry offsets buffer. Reject until packed offsets
-    // are built per image.
-    TORCH_CHECK(!(packed && segmented), "segmented sort is not supported for packed inputs");
-
-    uint32_t n_tiles            = tile_width * tile_height;
-    // the number of bits needed to encode the image id and tile id
-    const uint32_t image_n_bits = bits_for_count(I);
-    const uint32_t tile_n_bits  = bits_for_count(n_tiles);
-    // the first 32 bits are used for the image id and tile id altogether, so
-    // check if we have enough bits for them.
-    TORCH_CHECK(
-        image_n_bits + tile_n_bits <= 32,
-        "intersect_tile: (image, tile) id packing needs ",
-        image_n_bits + tile_n_bits,
-        " bits but only 32 are available (I=",
+    return run_intersect_tile_passes(
+        depths,
         I,
-        ", n_tiles=",
         n_tiles,
-        ")."
-    );
-
-    // first pass: compute number of tiles per gaussian
-    // TODO: This first pass can be avoided, see todo comment in intersect_tile_lidar_kernel.
-    at::Tensor tiles_per_gauss = at::empty_like(depths, opt.dtype(at::kInt));
-    int64_t n_isects;
-    at::Tensor cum_tiles_per_gauss;
-    at::Tensor offsets;
-    if(n_elements)
-    {
-        launch_intersect_tile_kernel(
-            // inputs
-            means2d,
-            radii,
-            depths,
-            conics,    // at::optional, AccuTile when provided, AABB fallback otherwise
-            opacities, // at::optional
-            packed ? image_ids : c10::nullopt,
-            packed ? gaussian_ids : c10::nullopt,
-            I,
-            tile_size,
-            tile_width,
-            tile_height,
-            c10::nullopt, // cum_tiles_per_gauss
-            // outputs
-            at::optional<at::Tensor>(tiles_per_gauss),
-            c10::nullopt, // isect_ids
-            c10::nullopt  // flatten_ids
-        );
-        // Explicit int64 to match the kernel's int64 read of cum_tiles_per_gauss.
-        cum_tiles_per_gauss = at::cumsum(tiles_per_gauss.view({-1}), 0, at::kLong);
-        n_isects            = cum_tiles_per_gauss[-1].item<int64_t>();
-        if(segmented)
+        sort,
+        segmented,
+        [&](const at::optional<at::Tensor> &cum_tiles_per_gauss,
+            const at::optional<at::Tensor> &tiles_per_gauss,
+            const at::optional<at::Tensor> &isect_ids,
+            const at::optional<at::Tensor> &flatten_ids)
         {
-            // offsets in the isect_ids and flatten_ids
-            offsets = at::cumsum(at::sum(tiles_per_gauss, -1).view({-1}), 0, at::kLong);
-            offsets = at::cat({at::tensor({0}, opt.dtype(at::kLong)), offsets});
-        }
-    }
-    else
-    {
-        n_isects = 0;
-    }
-
-    // second pass: compute isect_ids and flatten_ids as a packed tensor
-    at::Tensor isect_ids   = at::empty({n_isects}, opt.dtype(at::kLong));
-    at::Tensor flatten_ids = at::empty({n_isects}, opt.dtype(at::kInt));
-    if(n_isects)
-    {
-        launch_intersect_tile_kernel(
-            // inputs
-            means2d,
-            radii,
-            depths,
-            conics,    // at::optional, AccuTile when provided, AABB fallback otherwise
-            opacities, // at::optional
-            packed ? image_ids : c10::nullopt,
-            packed ? gaussian_ids : c10::nullopt,
-            I,
-            tile_size,
-            tile_width,
-            tile_height,
-            cum_tiles_per_gauss,
-            // outputs
-            c10::nullopt, // tiles_per_gauss
-            at::optional<at::Tensor>(isect_ids),
-            at::optional<at::Tensor>(flatten_ids)
-        );
-    }
-
-    // optionally sort the Gaussians by isect_ids
-    if(n_isects && sort)
-    {
-        at::Tensor isect_ids_sorted   = at::empty_like(isect_ids);
-        at::Tensor flatten_ids_sorted = at::empty_like(flatten_ids);
-        if(segmented)
-        {
-            segmented_radix_sort_double_buffer(
-                n_isects,
+            launch_intersect_tile_kernel(
+                // inputs
+                means2d,
+                radii,
+                depths,
+                conics,    // at::optional, AccuTile when provided, AABB fallback otherwise
+                opacities, // at::optional
+                packed ? image_ids : c10::nullopt,
+                packed ? gaussian_ids : c10::nullopt,
                 I,
-                image_n_bits,
-                tile_n_bits,
-                offsets,
+                tile_size,
+                tile_width,
+                tile_height,
+                cum_tiles_per_gauss,
+                // outputs
+                tiles_per_gauss,
                 isect_ids,
-                flatten_ids,
-                isect_ids_sorted,
-                flatten_ids_sorted
+                flatten_ids
             );
         }
-        else
-        {
-            radix_sort_double_buffer(
-                n_isects, image_n_bits, tile_n_bits, isect_ids, flatten_ids, isect_ids_sorted, flatten_ids_sorted
-            );
-        }
-        return {.tiles_per_gauss = tiles_per_gauss, .isect_ids = isect_ids_sorted, .flatten_ids = flatten_ids_sorted};
-    }
-    else
-    {
-        return {.tiles_per_gauss = tiles_per_gauss, .isect_ids = isect_ids, .flatten_ids = flatten_ids};
-    }
+    );
 }
+
+#if GSPLAT_BUILD_2DGS_PROJECTION
+TileIntersectResult intersect_tile_2dgs(
+    const at::Tensor &means2d,                 // [..., N, 2] or [nnz, 2]
+    const at::Tensor &radii,                   // [..., N, 2] or [nnz, 2]
+    const at::Tensor &depths,                  // [..., N] or [nnz]
+    const at::Tensor &ray_transforms,          // [..., N, 3, 3] or [nnz, 3, 3]
+    const at::optional<at::Tensor> &opacities, // [..., N] or [nnz]
+    const at::optional<at::Tensor> &uv_rects,  // [..., N, 4] or [nnz, 4]
+    const at::optional<at::Tensor> &image_ids, // [nnz]
+    std::optional<int64_t> n_images,
+    int64_t tile_size,
+    int64_t tile_width,
+    int64_t tile_height,
+    bool sort,
+    bool segmented
+)
+{
+    DEVICE_GUARD(means2d);
+
+    const bool packed = means2d.dim() == 2;
+    // The kernel needs no gaussian ids, so image_ids stands in for them in the
+    // packed-mode presence check.
+    check_intersect_tile_inputs(
+        means2d, radii, depths, at::optional<at::Tensor>(), opacities, image_ids, image_ids, packed
+    );
+    const auto lead = means2d.sizes().slice(0, means2d.dim() - 1);
+    CHECK_INPUT(ray_transforms);
+    TORCH_CHECK(ray_transforms.scalar_type() == means2d.scalar_type(), "ray_transforms must match means2d's dtype");
+    TORCH_CHECK(
+        ray_transforms.dim() == means2d.dim() + 1
+            && ray_transforms.size(-1) == 3
+            && ray_transforms.size(-2) == 3
+            && ray_transforms.sizes().slice(0, means2d.dim() - 1) == lead,
+        "ray_transforms must be [..., N, 3, 3] or [nnz, 3, 3], got ",
+        ray_transforms.sizes()
+    );
+    // 2DGS bounds the ellipse with the opacity, BBSplat bounds the quad with
+    // the uv rectangle (which already accounts for the opacity).
+    TORCH_CHECK(
+        opacities.has_value() != uv_rects.has_value(),
+        "intersect_tile_2dgs takes exactly one of opacities (2DGS) and uv_rects (BBSplat)"
+    );
+    if(opacities.has_value())
+    {
+        TORCH_CHECK(opacities->scalar_type() == at::kFloat, "opacities must be float32");
+    }
+    if(uv_rects.has_value())
+    {
+        CHECK_INPUT(uv_rects.value());
+        TORCH_CHECK(uv_rects->scalar_type() == at::kFloat, "uv_rects must be float32");
+        TORCH_CHECK(
+            uv_rects->dim() == means2d.dim()
+                && uv_rects->size(-1) == 4
+                && uv_rects->sizes().slice(0, means2d.dim() - 1) == lead,
+            "uv_rects must be [..., N, 4] or [nnz, 4], got ",
+            uv_rects->sizes()
+        );
+    }
+
+    const uint32_t n_tiles     = tile_width * tile_height;
+    const int64_t I            = intersect_image_count(means2d, n_images, packed, segmented, n_tiles);
+    const uint32_t tile_n_bits = bits_for_count(n_tiles);
+    return run_intersect_tile_passes(
+        depths,
+        I,
+        n_tiles,
+        sort,
+        segmented,
+        [&](const at::optional<at::Tensor> &cum_tiles_per_gauss,
+            const at::optional<at::Tensor> &tiles_per_gauss,
+            const at::optional<at::Tensor> &isect_ids,
+            const at::optional<at::Tensor> &flatten_ids)
+        {
+            launch_intersect_tile_2dgs_kernel(
+                // inputs
+                means2d,
+                radii,
+                depths,
+                ray_transforms,
+                opacities,
+                uv_rects,
+                packed ? image_ids : c10::nullopt,
+                tile_size,
+                tile_width,
+                tile_height,
+                tile_n_bits,
+                cum_tiles_per_gauss,
+                // outputs
+                tiles_per_gauss,
+                isect_ids,
+                flatten_ids
+            );
+        }
+    );
+}
+#endif // GSPLAT_BUILD_2DGS_PROJECTION
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> intersect_tile_privateuseone(
     const at::Tensor &means2d,                    // [..., N, 2] or [nnz, 2]
@@ -808,6 +937,9 @@ at::Tensor intersect_offset_privateuseone(
 void register_intersect_cuda_impl(torch::Library &m)
 {
     m.impl("intersect_tile", to_torch_op<&intersect_tile>);
+#if GSPLAT_BUILD_2DGS_PROJECTION
+    m.impl("intersect_tile_2dgs", to_torch_op<&intersect_tile_2dgs>);
+#endif
     m.impl("intersect_tile_lidar", to_torch_op<&intersect_tile_lidar>);
     m.impl("intersect_offset", to_torch_op<&intersect_offset>);
     m.impl("intersect_tile_sparse", &intersect_tile_sparse);

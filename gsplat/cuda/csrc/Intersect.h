@@ -79,6 +79,27 @@ TileIntersectResult intersect_tile(
     bool segmented
 );
 
+// Exact tile intersection for 2DGS (opacities: projected ellipse plus the
+// screen-space low-pass disk) and BBSplat (uv_rects: projected quad of the
+// [u0, u1] x [v0, v1] texture rectangle) primitives, from their ray
+// transforms. Pass exactly one of opacities and uv_rects. Falls back to the
+// means2d +- radii box when the footprint crosses the camera plane.
+TileIntersectResult intersect_tile_2dgs(
+    const at::Tensor &means2d,
+    const at::Tensor &radii,
+    const at::Tensor &depths,
+    const at::Tensor &ray_transforms,
+    const at::optional<at::Tensor> &opacities,
+    const at::optional<at::Tensor> &uv_rects,
+    const at::optional<at::Tensor> &image_ids,
+    std::optional<int64_t> n_images,
+    int64_t tile_size,
+    int64_t tile_width,
+    int64_t tile_height,
+    bool sort,
+    bool segmented
+);
+
 TileIntersectResult intersect_tile_lidar(
     const c10::intrusive_ptr<gsplat::RowOffsetStructuredSpinningLidarModelParametersExt> &lidar,
     const at::Tensor means2d,
@@ -146,6 +167,26 @@ void launch_intersect_tile_kernel(
     // sparse-only: restrict enumeration to active tiles ([I, tile_height,
     // tile_width] bool). nullopt keeps the original dense behavior.
     const at::optional<at::Tensor> tile_mask = c10::nullopt
+);
+
+void launch_intersect_tile_2dgs_kernel(
+    // inputs
+    const at::Tensor means2d,                 // [..., N, 2] or [nnz, 2]
+    const at::Tensor radii,                   // [..., N, 2] or [nnz, 2]
+    const at::Tensor depths,                  // [..., N] or [nnz]
+    const at::Tensor ray_transforms,          // [..., N, 3, 3] or [nnz, 3, 3]
+    const at::optional<at::Tensor> opacities, // [..., N] or [nnz]
+    const at::optional<at::Tensor> uv_rects,  // [..., N, 4] or [nnz, 4]
+    const at::optional<at::Tensor> image_ids, // [nnz]
+    const uint32_t tile_size,
+    const uint32_t tile_width,
+    const uint32_t tile_height,
+    const uint32_t tile_n_bits,
+    const at::optional<at::Tensor> cum_tiles_per_gauss, // [..., N] or [nnz]
+    // outputs
+    at::optional<at::Tensor> tiles_per_gauss, // [..., N] or [nnz]
+    at::optional<at::Tensor> isect_ids,       // [n_isects]
+    at::optional<at::Tensor> flatten_ids      // [n_isects]
 );
 
 void launch_intersect_tile_kernels(

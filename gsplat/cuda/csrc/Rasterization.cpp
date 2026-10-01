@@ -2201,6 +2201,412 @@ RasterizeToPixels2DGSResult rasterize_to_pixels_2dgs(
     };
 }
 
+#endif // GSPLAT_BUILD_2DGS
+
+#if GSPLAT_BUILD_BBSPLAT
+
+////////////////////////////////////////////////////
+// BBSplat (textured 2DGS billboards)
+////////////////////////////////////////////////////
+
+namespace
+{
+    void check_rasterize_to_pixels_bbsplat_inputs(
+        const at::Tensor &ray_transforms,
+        const at::Tensor &colors,
+        const at::Tensor &opacities,
+        const at::Tensor &normals,
+        const at::Tensor &densify,
+        const at::Tensor &texture_alphas,
+        const at::optional<at::Tensor> &texture_colors,
+        const at::Tensor &texture_ids,
+        const at::optional<at::Tensor> &backgrounds,
+        const at::optional<at::Tensor> &masks,
+        int64_t image_width,
+        int64_t image_height,
+        int64_t tile_size,
+        const at::Tensor &tile_offsets,
+        bool packed
+    )
+    {
+        TORCH_CHECK(
+            ray_transforms.dim() >= 3 && ray_transforms.size(-1) == 3 && ray_transforms.size(-2) == 3,
+            "ray_transforms must have shape [..., N, 3, 3] or [nnz, 3, 3], got ",
+            ray_transforms.sizes()
+        );
+        TORCH_CHECK(
+            tile_offsets.dim() >= 2,
+            "tile_offsets must have shape [..., tile_height, tile_width], got ",
+            tile_offsets.sizes()
+        );
+        TORCH_CHECK(!packed || ray_transforms.dim() == 3, "packed ray_transforms must have shape [nnz, 3, 3]");
+
+        // Per-primitive leading shape: [..., N] (image dims + N) or [nnz].
+        at::IntArrayRef prim_dims = ray_transforms.sizes().slice(0, ray_transforms.dim() - 2);
+        const int64_t channels    = colors.size(-1);
+
+        at::DimVector colors_shape(prim_dims);
+        colors_shape.append({channels});
+        at::DimVector normals_shape(prim_dims);
+        normals_shape.append({3});
+        at::DimVector densify_shape(prim_dims);
+        densify_shape.append({2});
+        TORCH_CHECK(colors.sizes() == colors_shape, "colors must have shape [..., N, channels], got ", colors.sizes());
+        TORCH_CHECK(opacities.sizes() == prim_dims, "opacities must have shape [..., N], got ", opacities.sizes());
+        TORCH_CHECK(normals.sizes() == normals_shape, "normals must have shape [..., N, 3], got ", normals.sizes());
+        TORCH_CHECK(densify.sizes() == densify_shape, "densify must have shape [..., N, 2], got ", densify.sizes());
+        TORCH_CHECK(
+            texture_ids.sizes() == prim_dims && texture_ids.scalar_type() == at::kInt,
+            "texture_ids must be int32 with shape [..., N] or [nnz], got ",
+            texture_ids.scalar_type(),
+            " ",
+            texture_ids.sizes()
+        );
+
+        TORCH_CHECK(
+            texture_alphas.dim() == 3 && texture_alphas.size(1) == texture_alphas.size(2),
+            "texture_alphas must have shape [M, S, S], got ",
+            texture_alphas.sizes()
+        );
+        TORCH_CHECK(texture_alphas.size(-1) >= 2, "texture size must be at least 2, got ", texture_alphas.size(-1));
+        if(texture_colors.has_value())
+        {
+            const at::Tensor &tc = texture_colors.value();
+            TORCH_CHECK(
+                tc.dim() == 4
+                    && tc.size(0) == texture_alphas.size(0)
+                    && tc.size(1) == texture_alphas.size(1)
+                    && tc.size(2) == texture_alphas.size(2),
+                "texture_colors must have shape [M, S, S, TC] matching texture_alphas ",
+                texture_alphas.sizes(),
+                ", got ",
+                tc.sizes()
+            );
+            TORCH_CHECK(
+                tc.size(3) >= 1 && tc.size(3) <= channels,
+                "texture_colors channels must be in [1, ",
+                channels,
+                "], got ",
+                tc.size(3)
+            );
+        }
+
+        at::DimVector image_dims(tile_offsets.sizes().slice(0, tile_offsets.dim() - 2));
+        if(backgrounds.has_value())
+        {
+            at::DimVector backgrounds_shape(image_dims);
+            backgrounds_shape.append({channels});
+            TORCH_CHECK(
+                backgrounds.value().sizes() == backgrounds_shape,
+                "backgrounds must have shape [..., channels], got ",
+                backgrounds.value().sizes()
+            );
+        }
+        if(masks.has_value())
+        {
+            TORCH_CHECK(
+                masks.value().sizes() == tile_offsets.sizes(),
+                "masks must have the same shape as tile_offsets; got masks ",
+                masks.value().sizes(),
+                " and tile_offsets ",
+                tile_offsets.sizes()
+            );
+        }
+        TORCH_CHECK(
+            tile_offsets.size(-2) * tile_size >= image_height && tile_offsets.size(-1) * tile_size >= image_width,
+            "tile_offsets do not cover the image"
+        );
+    }
+} // namespace
+
+// Returns (renders, alphas, render_normals, render_distort, render_median,
+// impacts, last_ids, median_ids); impacts is empty unless compute_impact, and
+// the last two are forward-internal for the backward.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+    rasterize_to_pixels_bbsplat_fwd(
+        const at::Tensor &ray_transforms,               // [..., N, 3, 3] or [nnz, 3, 3]
+        const at::Tensor &colors,                       // [..., N, channels] or [nnz, channels]
+        const at::Tensor &opacities,                    // [..., N]  or [nnz]
+        const at::Tensor &normals,                      // [..., N, 3] or [nnz, 3]
+        const at::Tensor &densify,                      // [..., N, 2] or [nnz, 2]
+        const at::Tensor &texture_alphas,               // [M, S, S]
+        const at::optional<at::Tensor> &texture_colors, // [M, S, S, TC]
+        const at::Tensor &texture_ids,                  // [..., N] or [nnz]
+        const at::optional<at::Tensor> &backgrounds,    // [..., channels]
+        const at::optional<at::Tensor> &masks,          // [..., tile_height, tile_width]
+        int64_t image_width,
+        int64_t image_height,
+        int64_t tile_size,
+        const at::Tensor &tile_offsets, // [..., tile_height, tile_width]
+        const at::Tensor &flatten_ids,  // [n_isects]
+        bool packed,
+        bool compute_impact
+    )
+{
+    check_rasterize_to_pixels_bbsplat_inputs(
+        ray_transforms,
+        colors,
+        opacities,
+        normals,
+        densify,
+        texture_alphas,
+        texture_colors,
+        texture_ids,
+        backgrounds,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        tile_offsets,
+        packed
+    );
+
+    DEVICE_GUARD(ray_transforms);
+    CHECK_INPUT(ray_transforms);
+    CHECK_INPUT(colors);
+    CHECK_INPUT(opacities);
+    CHECK_INPUT(normals);
+    CHECK_INPUT(texture_alphas);
+    CHECK_INPUT(texture_ids);
+    CHECK_INPUT(tile_offsets);
+    CHECK_INPUT(flatten_ids);
+    if(texture_colors.has_value())
+    {
+        CHECK_INPUT(texture_colors.value());
+    }
+    if(backgrounds.has_value())
+    {
+        CHECK_INPUT(backgrounds.value());
+    }
+    if(masks.has_value())
+    {
+        CHECK_INPUT(masks.value());
+    }
+    auto opt = ray_transforms.options();
+
+    at::DimVector image_dims(tile_offsets.sizes().slice(0, tile_offsets.dim() - 2));
+    auto pixel_shape = [&](std::initializer_list<int64_t> tail)
+    {
+        at::DimVector dims(image_dims);
+        dims.append({image_height, image_width});
+        dims.append(tail);
+        return dims;
+    };
+    const int64_t channels = colors.size(-1);
+
+    at::Tensor renders        = at::empty(pixel_shape({channels}), opt);
+    at::Tensor alphas         = at::empty(pixel_shape({1}), opt);
+    at::Tensor render_normals = at::empty(pixel_shape({3}), opt);
+    at::Tensor render_distort = at::empty(pixel_shape({1}), opt);
+    at::Tensor render_median  = at::empty(pixel_shape({1}), opt);
+    at::Tensor last_ids       = at::empty(pixel_shape({}), opt.dtype(at::kInt));
+    at::Tensor median_ids     = at::empty(pixel_shape({}), opt.dtype(at::kInt));
+    // per-splat sum of alpha * T over all pixels (BBSplat's "impact")
+    at::Tensor impacts        = compute_impact ? at::zeros_like(opacities) : at::empty({0}, opt);
+
+    launch_rasterize_to_pixels_bbsplat_fwd_kernel(
+        ray_transforms,
+        colors,
+        opacities,
+        normals,
+        texture_alphas,
+        texture_colors,
+        texture_ids,
+        backgrounds,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        tile_offsets,
+        flatten_ids,
+        renders,
+        alphas,
+        render_normals,
+        render_distort,
+        render_median,
+        last_ids,
+        median_ids,
+        compute_impact ? at::optional<at::Tensor>(impacts) : at::nullopt
+    );
+    return {renders, alphas, render_normals, render_distort, render_median, impacts, last_ids, median_ids};
+}
+
+// Returns (v_ray_transforms, v_colors, v_opacities, v_normals, v_densify,
+// v_texture_alphas, v_texture_colors?, v_backgrounds?).
+std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::optional<at::Tensor>,
+    at::optional<at::Tensor>
+>
+    rasterize_to_pixels_bbsplat_bwd(
+        const at::Tensor &ray_transforms,
+        const at::Tensor &colors,
+        const at::Tensor &opacities,
+        const at::Tensor &normals,
+        const at::Tensor &densify,
+        const at::Tensor &texture_alphas,
+        const at::optional<at::Tensor> &texture_colors,
+        const at::Tensor &texture_ids,
+        const at::optional<at::Tensor> &backgrounds,
+        const at::optional<at::Tensor> &masks,
+        const at::Tensor &tile_offsets,
+        const at::Tensor &flatten_ids,
+        const at::Tensor &render_colors,
+        const at::Tensor &render_alphas,
+        const at::Tensor &last_ids,
+        const at::Tensor &median_ids,
+        int64_t image_width,
+        int64_t image_height,
+        int64_t tile_size,
+        const at::Tensor &v_render_colors_in,
+        const at::Tensor &v_render_alphas_in,
+        const at::Tensor &v_render_normals_in,
+        const at::Tensor &v_render_distort_in,
+        const at::Tensor &v_render_median_in,
+        bool compute_v_backgrounds
+    )
+{
+    DEVICE_GUARD(ray_transforms);
+    CHECK_INPUT(ray_transforms);
+    CHECK_INPUT(colors);
+    CHECK_INPUT(opacities);
+    CHECK_INPUT(normals);
+    CHECK_INPUT(densify);
+    CHECK_INPUT(texture_alphas);
+    CHECK_INPUT(texture_ids);
+    CHECK_INPUT(tile_offsets);
+    CHECK_INPUT(flatten_ids);
+    CHECK_INPUT(render_colors);
+    CHECK_INPUT(render_alphas);
+    CHECK_INPUT(last_ids);
+    CHECK_INPUT(median_ids);
+    if(texture_colors.has_value())
+    {
+        CHECK_INPUT(texture_colors.value());
+    }
+    if(backgrounds.has_value())
+    {
+        CHECK_INPUT(backgrounds.value());
+    }
+    if(masks.has_value())
+    {
+        CHECK_INPUT(masks.value());
+    }
+    CHECK_DENSE(v_render_colors_in);
+    CHECK_DENSE(v_render_alphas_in);
+    CHECK_DENSE(v_render_normals_in);
+    CHECK_DENSE(v_render_distort_in);
+    CHECK_DENSE(v_render_median_in);
+    at::Tensor v_render_colors  = v_render_colors_in.contiguous();
+    at::Tensor v_render_alphas  = v_render_alphas_in.contiguous();
+    at::Tensor v_render_normals = v_render_normals_in.contiguous();
+    at::Tensor v_render_distort = v_render_distort_in.contiguous();
+    at::Tensor v_render_median  = v_render_median_in.contiguous();
+
+    at::Tensor v_ray_transforms = at::zeros_like(ray_transforms);
+    at::Tensor v_colors         = at::zeros_like(colors);
+    at::Tensor v_opacities      = at::zeros_like(opacities);
+    at::Tensor v_normals        = at::zeros_like(normals);
+    at::Tensor v_densify        = at::zeros_like(densify);
+    at::Tensor v_texture_alphas = at::zeros_like(texture_alphas);
+    at::optional<at::Tensor> v_texture_colors;
+    if(texture_colors.has_value())
+    {
+        v_texture_colors = at::zeros_like(texture_colors.value());
+    }
+
+    launch_rasterize_to_pixels_bbsplat_bwd_kernel(
+        ray_transforms,
+        colors,
+        opacities,
+        normals,
+        texture_alphas,
+        texture_colors,
+        texture_ids,
+        backgrounds,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        tile_offsets,
+        flatten_ids,
+        render_colors,
+        render_alphas,
+        last_ids,
+        median_ids,
+        v_render_colors,
+        v_render_alphas,
+        v_render_normals,
+        v_render_distort,
+        v_render_median,
+        v_ray_transforms,
+        v_colors,
+        v_opacities,
+        v_normals,
+        v_densify,
+        v_texture_alphas,
+        v_texture_colors
+    );
+
+    // Background contribution: incoming color gradient weighted by the final
+    // transmittance.
+    at::optional<at::Tensor> v_backgrounds;
+    if(compute_v_backgrounds)
+    {
+        v_backgrounds = at::mul(v_render_colors, at::rsub(render_alphas, 1.0)).sum({-3, -2});
+    }
+
+    return {
+        v_ray_transforms,
+        v_colors,
+        v_opacities,
+        v_normals,
+        v_densify,
+        v_texture_alphas,
+        v_texture_colors,
+        v_backgrounds,
+    };
+}
+
+at::Tensor bbsplat_uv_rects(
+    const at::Tensor &texture_alphas,         // [M, S, S]
+    const at::optional<at::Tensor> &opacities // [M]
+)
+{
+    DEVICE_GUARD(texture_alphas);
+    CHECK_INPUT(texture_alphas);
+    TORCH_CHECK(
+        texture_alphas.dim() == 3 && texture_alphas.size(1) == texture_alphas.size(2),
+        "texture_alphas must have shape [M, S, S], got ",
+        texture_alphas.sizes()
+    );
+    TORCH_CHECK(texture_alphas.size(-1) >= 2, "texture size must be at least 2, got ", texture_alphas.size(-1));
+    if(opacities.has_value())
+    {
+        CHECK_INPUT(opacities.value());
+        TORCH_CHECK(
+            opacities->dim() == 1 && opacities->size(0) == texture_alphas.size(0),
+            "opacities must have shape [M], got ",
+            opacities->sizes()
+        );
+        TORCH_CHECK(
+            opacities->scalar_type() == texture_alphas.scalar_type(), "opacities must match texture_alphas' dtype"
+        );
+    }
+    at::Tensor uv_rects = at::empty({texture_alphas.size(0), 4}, texture_alphas.options().dtype(at::kFloat));
+    launch_bbsplat_uv_rects_kernel(texture_alphas, opacities, uv_rects);
+    return uv_rects;
+}
+
+#endif // GSPLAT_BUILD_BBSPLAT
+
+#if GSPLAT_BUILD_2DGS
+
 struct RasterizeToIndices2DGSResult
 {
     at::Tensor gaussian_ids;
@@ -3610,6 +4016,12 @@ void register_rasterization_cuda_impl(torch::Library &m)
     m.impl("rasterize_to_pixels_2dgs", to_torch_op<&rasterize_to_pixels_2dgs_fwd>);
     m.impl("rasterize_to_pixels_2dgs_bwd", to_torch_op<&rasterize_to_pixels_2dgs_bwd>);
     m.impl("rasterize_to_indices_2dgs", to_torch_op<&rasterize_to_indices_2dgs>);
+#endif
+
+#if GSPLAT_BUILD_BBSPLAT
+    m.impl("rasterize_to_pixels_bbsplat", to_torch_op<&rasterize_to_pixels_bbsplat_fwd>);
+    m.impl("rasterize_to_pixels_bbsplat_bwd", to_torch_op<&rasterize_to_pixels_bbsplat_bwd>);
+    m.impl("bbsplat_uv_rects", &bbsplat_uv_rects);
 #endif
 
     m.impl("rasterize_to_pixels_from_world_3dgs", to_torch_op<&rasterize_to_pixels_from_world_3dgs>);

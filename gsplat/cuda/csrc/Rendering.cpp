@@ -1783,7 +1783,8 @@ Rasterization2DGSResult rasterization_2dgs(
             near_plane,
             far_plane,
             radius_clip,
-            sparse_grad
+            sparse_grad,
+            opacities // opacity-aware culling and radii
         );
         at::Tensor batch_ids = projection.batch_ids;
         camera_ids           = projection.camera_ids;
@@ -1802,7 +1803,18 @@ Rasterization2DGSResult rasterization_2dgs(
     else
     {
         Projection2DGSFusedResult projection = projection_2dgs_fused(
-            means, quats, scales, viewmats, Ks, image_width, image_height, eps2d, near_plane, far_plane, radius_clip
+            means,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            image_width,
+            image_height,
+            eps2d,
+            near_plane,
+            far_plane,
+            radius_clip,
+            opacities // opacity-aware culling and radii
         );
         radii                              = projection.radii;
         means2d                            = projection.means2d;
@@ -1810,7 +1822,8 @@ Rasterization2DGSResult rasterization_2dgs(
         ray_transforms                     = projection.ray_transforms;
         normals                            = projection.normals;
         std::vector<int64_t> opacity_shape = batch_shape_with_2dgs(means, {C, N});
-        projected_opacities                = opacities.unsqueeze(batch_ndim).expand(opacity_shape);
+        // The rasterizer needs contiguous per-camera opacities.
+        projected_opacities                = opacities.unsqueeze(batch_ndim).expand(opacity_shape).contiguous();
     }
 
     // Gradient accumulator for densification (surfaced via meta["gradient_2dgs"]).
@@ -1819,15 +1832,16 @@ Rasterization2DGSResult rasterization_2dgs(
     // --- Identify intersecting tiles --------------------------------------
     const int64_t tile_width   = static_cast<int64_t>(std::ceil(image_width / static_cast<double>(tile_size)));
     const int64_t tile_height  = static_cast<int64_t>(std::ceil(image_height / static_cast<double>(tile_size)));
-    TileIntersectResult isects = call_torch_op<&intersect_tile>(
-        "gsplat::intersect_tile",
+    // Exact footprint (projected ellipse + low-pass disk) rather than the radii box.
+    TileIntersectResult isects = call_torch_op<&intersect_tile_2dgs>(
+        "gsplat::intersect_tile_2dgs",
         means2d.contiguous(),
         radii.contiguous(),
         depths.contiguous(),
-        at::optional<at::Tensor>(),
+        ray_transforms.contiguous(),
+        at::optional<at::Tensor>(projected_opacities),
         at::optional<at::Tensor>(),
         contiguous_optional(image_ids),
-        contiguous_optional(gaussian_ids_opt),
         std::optional<int64_t>(I),
         tile_size,
         tile_width,

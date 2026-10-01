@@ -18,7 +18,7 @@
 
 #include "Config.h"
 
-#if GSPLAT_BUILD_2DGS
+#if GSPLAT_BUILD_2DGS_PROJECTION
 
 #    include <ATen/Dispatch.h>
 #    include <ATen/core/Tensor.h>
@@ -28,6 +28,7 @@
 #    include <cub/cub.cuh>
 
 #    include "Common.h"
+#    include "Footprint2DGS.cuh"
 #    include "Projection.h"
 #    include "Projection2DGS.cuh" // Utils for 2DGS Projection
 #    include "Utils.cuh"
@@ -51,6 +52,8 @@ __global__ void projection_2dgs_packed_fwd_kernel(
     const scalar_t near_plane,
     const scalar_t far_plane,
     const scalar_t radius_clip,
+    const float *__restrict__ opacities,     // [B, N] optional: opacity-aware culling (2DGS)
+    const float *__restrict__ uv_rects,      // [B, N, 4] optional: texture-aware culling (BBSplat)
     const int32_t *__restrict__ block_accum, // [B * C * blocks_per_row] packing helper
     int32_t *__restrict__ block_cnts,        // [B * C * blocks_per_row] packing helper
     // outputs
@@ -145,8 +148,29 @@ __global__ void projection_2dgs_packed_fwd_kernel(
 
         const vec2 temp        = {sum(f * M0 * M0), sum(f * M1 * M1)};
         const vec2 half_extend = mean2d * mean2d - temp;
-        radius_x               = ceil(GAUSSIAN_EXTEND * sqrt(max(1e-4, half_extend.x)));
-        radius_y               = ceil(GAUSSIAN_EXTEND * sqrt(max(1e-4, half_extend.y)));
+        float2 radius          = {
+            ceil(GAUSSIAN_EXTEND * sqrt(max(1e-4, half_extend.x))),
+            ceil(GAUSSIAN_EXTEND * sqrt(max(1e-4, half_extend.y))),
+        };
+        // Optionally tighten the cull box to the exact (opacity- or
+        // texture-aware) footprint, see Footprint2DGS.cuh.
+        const float H[9]  = {M0.x, M0.y, M0.z, M1.x, M1.y, M1.z, M2.x, M2.y, M2.z};
+        const int64_t pid = (int64_t)bid * N + gid;
+        float2 bbox_min, bbox_max;
+        if(!footprint2dgs::projection_bounds(
+               H,
+               {mean2d.x, mean2d.y},
+               opacities != nullptr ? opacities + pid : nullptr,
+               uv_rects != nullptr ? uv_rects + pid * 4 : nullptr,
+               radius,
+               bbox_min,
+               bbox_max
+           ))
+        {
+            valid = false;
+        }
+        radius_x = radius.x;
+        radius_y = radius.y;
 
         if(radius_x <= radius_clip && radius_y <= radius_clip)
         {
@@ -154,10 +178,7 @@ __global__ void projection_2dgs_packed_fwd_kernel(
         }
 
         // mask out gaussians outside the image region
-        if(mean2d.x + radius_x <= 0
-           || mean2d.x - radius_x >= image_width
-           || mean2d.y + radius_y <= 0
-           || mean2d.y - radius_y >= image_height)
+        if(bbox_max.x <= 0 || bbox_min.x >= image_width || bbox_max.y <= 0 || bbox_min.y >= image_height)
         {
             valid = false;
         }
@@ -254,6 +275,8 @@ void launch_projection_2dgs_packed_fwd_kernel(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
+    const at::optional<at::Tensor> opacities,   // [..., N]
+    const at::optional<at::Tensor> uv_rects,    // [..., N, 4]
     const at::optional<at::Tensor> block_accum, // [B * C * blocks_per_row] packing helper
     // outputs
     at::optional<at::Tensor> block_cnts,     // [B * C * blocks_per_row] packing helper
@@ -310,6 +333,8 @@ void launch_projection_2dgs_packed_fwd_kernel(
         near_plane,
         far_plane,
         radius_clip,
+        opacities.has_value() ? opacities.value().const_data_ptr<float>() : nullptr,
+        uv_rects.has_value() ? uv_rects.value().const_data_ptr<float>() : nullptr,
         block_accum.has_value() ? block_accum.value().const_data_ptr<int32_t>() : nullptr,
         block_cnts.has_value() ? block_cnts.value().data_ptr<int32_t>() : nullptr,
         indptr.has_value() ? indptr.value().data_ptr<int32_t>() : nullptr,

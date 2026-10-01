@@ -15,7 +15,7 @@
 
 [build-system]
 requires = [
-    "setuptools>=42",
+    "setuptools>=64",
     "wheel",
     "ninja",
     "torch>=2.7",
@@ -23,4 +23,97 @@ requires = [
     "rich",
 ]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "gsplat"
+description = "Python package for differentiable rasterization of gaussians"
+keywords = ["gaussian", "splatting", "cuda"]
+requires-python = ">=3.10"
+# Computed in setup.py: the version comes from gsplat/version.py, and the
+# extras depend on config.yaml and the local CUDA toolkit.
+dynamic = ["version", "dependencies", "optional-dependencies"]
+
+[project.urls]
+Homepage = "https://github.com/nerfstudio-project/gsplat"
+
+[dependency-groups]
+# Mirrors examples/requirements.txt; install with `uv sync --group examples`.
+examples = [
+    "nvidia-ncore>=19.0.0",
+    "pycolmap>=3.10.0",
+    "torchvision==0.24.1",
+    "viser",
+    "nerfview @ git+https://github.com/nerfstudio-project/nerfview@4538024fe0d15fd1a0e4d760f3695fc44ca72787",
+    "imageio[ffmpeg]",
+    "numpy>=2.0,<3.0",
+    "scipy",
+    "scikit-learn",
+    "tqdm",
+    "torchmetrics==1.8.2",
+    "opencv-python-headless",
+    "tyro>=0.8.8,!=1.0.9,!=1.0.10",
+    "Pillow",
+    "piexif",
+    "tensorboard",
+    "tensorly",
+    "pyyaml",
+    "matplotlib",
+    "fused-ssim @ git+https://github.com/rahul-goel/fused-ssim@a7c48d6dd7ac6dc39a7958c7c4452e0b10418f38",
+    "splines",
+]
+# Optional CUDA post-processing modules for simple_trainer.py, only imported with
+# `--post_processing ppisp` or `--post_processing bilateral_grid
+# --bilateral_grid_fused`. Install with `uv sync --group examples --group post-processing`.
+post-processing = [
+    "fused-bilagrid @ git+https://github.com/harry7557558/fused-bilagrid@49f0ef06c9f81810fb9b5dd9027cf1844950cc16",
+    "ppisp @ git+https://github.com/nv-tlabs/ppisp@v1.2.1",
+]
+
+# `uv sync` setup: install CUDA torch from the PyTorch index, and build gsplat's
+# CUDA extensions against the same torch that ends up in the environment.
+# torch is pinned identically for runtime and build (uv's `match-runtime` needs
+# static dependency metadata, which setup.py doesn't provide). 2.9.1 matches
+# GPU CI; torch 2.12+ switched JIT builds to C++20, which breaks nerfacc.
+[tool.uv]
+constraint-dependencies = ["torch==2.9.1"]
+build-constraint-dependencies = ["torch==2.9.1"]
+# Plain `uv sync` / `uv run` also install the example dependencies.
+default-groups = ["examples"]
+# Rebuild gsplat when the native sources or the build settings below change
+# (uv otherwise reuses the cached wheel).
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "setup.py" },
+    { file = "config.yaml" },
+    { file = "gsplat/**/*.cu" },
+    { file = "gsplat/**/*.cuh" },
+    { file = "gsplat/**/*.cpp" },
+    { file = "gsplat/**/*.h" },
+    { env = "CUDA_HOME" },
+]
+
+# Build settings for gsplat's CUDA extension, read by setup.py and
+# gsplat/cuda/build.py. Kept here rather than in the shell so every `uv sync` /
+# `uv run` builds the same way. Setting any BUILD_<feature>=1 disables all
+# features not listed. Machine-specific settings come from the environment:
+# CUDA_HOME selects the toolkit (else nvcc on PATH), and without
+# TORCH_CUDA_ARCH_LIST torch targets the GPUs visible at build time.
+[tool.uv.extra-build-variables]
+gsplat = { BUILD_3DGS = "1", BUILD_2DGS = "1", BUILD_ADAM = "1", BUILD_RELOC = "1", BUILD_LOSSES = "1", BUILD_BBSPLAT = "1", BUILD_EXPERIMENTAL = "0", NUM_CHANNELS = "1,3,4" }
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126", marker = "sys_platform != 'darwin'" }]
+torchvision = [{ index = "pytorch-cu126", marker = "sys_platform != 'darwin'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.extra-build-dependencies]
+gsplat = ["torch"]
+# CUDA extensions from the examples group that import torch in setup.py.
+fused-ssim = ["torch"]
+fused-bilagrid = ["torch"]
+ppisp = ["torch"]
 

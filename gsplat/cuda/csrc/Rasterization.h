@@ -470,6 +470,82 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
 );
 
 /////////////////////////////////////////////////
+// rasterize_to_pixels_bbsplat (textured 2DGS billboards)
+/////////////////////////////////////////////////
+
+void launch_rasterize_to_pixels_bbsplat_fwd_kernel(
+    const at::Tensor ray_transforms,               // [..., N, 3, 3] or [nnz, 3, 3]
+    const at::Tensor colors,                       // [..., N, channels] or [nnz, channels]
+    const at::Tensor opacities,                    // [..., N]  or [nnz]
+    const at::Tensor normals,                      // [..., N, 3] or [nnz, 3]
+    const at::Tensor texture_alphas,               // [M, S, S]
+    const at::optional<at::Tensor> texture_colors, // [M, S, S, TC]
+    const at::Tensor texture_ids,                  // [..., N] or [nnz]
+    const at::optional<at::Tensor> backgrounds,    // [..., channels]
+    const at::optional<at::Tensor> masks,          // [..., tile_height, tile_width]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets, // [..., tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
+    // outputs
+    at::Tensor renders,              // [..., image_height, image_width, channels]
+    at::Tensor alphas,               // [..., image_height, image_width, 1]
+    at::Tensor render_normals,       // [..., image_height, image_width, 3]
+    at::Tensor render_distort,       // [..., image_height, image_width, 1]
+    at::Tensor render_median,        // [..., image_height, image_width, 1]
+    at::Tensor last_ids,             // [..., image_height, image_width]
+    at::Tensor median_ids,           // [..., image_height, image_width]
+    at::optional<at::Tensor> impacts // [..., N] or [nnz]
+);
+// Splat-local rectangles (u0, u1, v0, v1) outside of which no BBSplat texel
+// reaches ALPHA_THRESHOLD; see bbsplat_uv_rects in _wrapper.py.
+at::Tensor bbsplat_uv_rects(
+    const at::Tensor &texture_alphas,         // [M, S, S]
+    const at::optional<at::Tensor> &opacities // [M]
+);
+void launch_bbsplat_uv_rects_kernel(
+    const at::Tensor texture_alphas,          // [M, S, S]
+    const at::optional<at::Tensor> opacities, // [M]
+    at::Tensor uv_rects                       // [M, 4] float32
+);
+void launch_rasterize_to_pixels_bbsplat_bwd_kernel(
+    const at::Tensor ray_transforms,               // [..., N, 3, 3] or [nnz, 3, 3]
+    const at::Tensor colors,                       // [..., N, channels] or [nnz, channels]
+    const at::Tensor opacities,                    // [..., N] or [nnz]
+    const at::Tensor normals,                      // [..., N, 3] or [nnz, 3]
+    const at::Tensor texture_alphas,               // [M, S, S]
+    const at::optional<at::Tensor> texture_colors, // [M, S, S, TC]
+    const at::Tensor texture_ids,                  // [..., N] or [nnz]
+    const at::optional<at::Tensor> backgrounds,    // [..., channels]
+    const at::optional<at::Tensor> masks,          // [..., tile_height, tile_width]
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    const at::Tensor tile_offsets, // [..., tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
+    // forward outputs
+    const at::Tensor render_colors, // [..., image_height, image_width, channels]
+    const at::Tensor render_alphas, // [..., image_height, image_width, 1]
+    const at::Tensor last_ids,      // [..., image_height, image_width]
+    const at::Tensor median_ids,    // [..., image_height, image_width]
+    // gradients of outputs
+    const at::Tensor v_render_colors,  // [..., image_height, image_width, channels]
+    const at::Tensor v_render_alphas,  // [..., image_height, image_width, 1]
+    const at::Tensor v_render_normals, // [..., image_height, image_width, 3]
+    const at::Tensor v_render_distort, // [..., image_height, image_width, 1]
+    const at::Tensor v_render_median,  // [..., image_height, image_width, 1]
+    // outputs
+    at::Tensor v_ray_transforms,              // [..., N, 3, 3] or [nnz, 3, 3]
+    at::Tensor v_colors,                      // [..., N, channels] or [nnz, channels]
+    at::Tensor v_opacities,                   // [..., N] or [nnz]
+    at::Tensor v_normals,                     // [..., N, 3] or [nnz, 3]
+    at::Tensor v_densify,                     // [..., N, 2] or [nnz, 2]
+    at::Tensor v_texture_alphas,              // [M, S, S]
+    at::optional<at::Tensor> v_texture_colors // [M, S, S, TC]
+);
+
+/////////////////////////////////////////////////
 // rasterize_to_indices_2dgs
 /////////////////////////////////////////////////
 

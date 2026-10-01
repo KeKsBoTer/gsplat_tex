@@ -25,12 +25,13 @@
 //   GSPLAT_BUILD_3DGUT=0 GSPLAT_BUILD_2DGS=0 -> build everything except 3dgut and 2dgs
 //   <no GSPLAT_BUILD_* defined> -> build everything
 
-#if defined(GSPLAT_BUILD_2DGS) && GSPLAT_BUILD_2DGS      \
-    || defined(GSPLAT_BUILD_3DGS) && GSPLAT_BUILD_3DGS   \
-    || defined(GSPLAT_BUILD_3DGUT) && GSPLAT_BUILD_3DGUT \
-    || defined(GSPLAT_BUILD_ADAM) && GSPLAT_BUILD_ADAM   \
-    || defined(GSPLAT_BUILD_RELOC) && GSPLAT_BUILD_RELOC \
-    || defined(GSPLAT_BUILD_LOSSES) && GSPLAT_BUILD_LOSSES
+#if defined(GSPLAT_BUILD_2DGS) && GSPLAT_BUILD_2DGS        \
+    || defined(GSPLAT_BUILD_3DGS) && GSPLAT_BUILD_3DGS     \
+    || defined(GSPLAT_BUILD_3DGUT) && GSPLAT_BUILD_3DGUT   \
+    || defined(GSPLAT_BUILD_ADAM) && GSPLAT_BUILD_ADAM     \
+    || defined(GSPLAT_BUILD_RELOC) && GSPLAT_BUILD_RELOC   \
+    || defined(GSPLAT_BUILD_LOSSES) && GSPLAT_BUILD_LOSSES \
+    || defined(GSPLAT_BUILD_BBSPLAT) && GSPLAT_BUILD_BBSPLAT
 
 #    define GSPLAT_DEFAULT_ENABLE_BUILD 0
 #else
@@ -60,6 +61,14 @@
 #ifndef GSPLAT_BUILD_LOSSES
 #    define GSPLAT_BUILD_LOSSES GSPLAT_DEFAULT_ENABLE_BUILD
 #endif
+
+#ifndef GSPLAT_BUILD_BBSPLAT
+#    define GSPLAT_BUILD_BBSPLAT GSPLAT_DEFAULT_ENABLE_BUILD
+#endif
+
+// BBSplat rasterizes 2DGS-projected primitives, so the 2DGS projection is
+// built whenever either module is.
+#define GSPLAT_BUILD_2DGS_PROJECTION (GSPLAT_BUILD_2DGS || GSPLAT_BUILD_BBSPLAT)
 
 // Camera wrappers are a Python-exposed testing facility, not a core module:
 // build.py omits CameraWrappers.cu from the source list when this flag is off,

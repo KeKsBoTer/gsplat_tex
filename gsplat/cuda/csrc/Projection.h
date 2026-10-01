@@ -57,7 +57,9 @@ Projection2DGSFusedResult projection_2dgs_fused(
     double eps2d,
     double near_plane,
     double far_plane,
-    double radius_clip
+    double radius_clip,
+    const at::optional<at::Tensor> &opacities = c10::nullopt, // [..., N]
+    const at::optional<at::Tensor> &uv_rects  = c10::nullopt  // [..., N, 4]
 );
 
 struct Projection2DGSPackedResult
@@ -84,7 +86,9 @@ Projection2DGSPackedResult projection_2dgs_packed(
     double near_plane,
     double far_plane,
     double radius_clip,
-    bool sparse_grad
+    bool sparse_grad,
+    const at::optional<at::Tensor> &opacities = c10::nullopt, // [..., N]
+    const at::optional<at::Tensor> &uv_rects  = c10::nullopt  // [..., N, 4]
 );
 
 struct ProjectionEWA3DGSFusedFwdResult
@@ -452,6 +456,8 @@ void launch_projection_2dgs_fused_fwd_kernel(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
+    const at::optional<at::Tensor> opacities, // [..., N]
+    const at::optional<at::Tensor> uv_rects,  // [..., N, 4]
     // outputs
     at::Tensor radii,          // [..., C, N, 2]
     at::Tensor means2d,        // [..., C, N, 2]
@@ -496,6 +502,8 @@ void launch_projection_2dgs_packed_fwd_kernel(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
+    const at::optional<at::Tensor> opacities,   // [..., N]
+    const at::optional<at::Tensor> uv_rects,    // [..., N, 4]
     const at::optional<at::Tensor> block_accum, // [B * C * blocks_per_row] packing helper
     // outputs
     at::optional<at::Tensor> block_cnts,     // [B * C * blocks_per_row] packing helper
